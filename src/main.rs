@@ -44,6 +44,38 @@ pub extern "C" fn _start() -> ! {
 
     velora_os::init();
 
+    //The commented code below this comment was for simulating
+    // a page fault.
+    // We used an unsafe to write to an invalid memory location address 0xdeadbeef
+    // The virtual address is not mapped to any physical addr in the page tables.
+    // This will cause a page fault.
+    // As observed, when the kernel is started, it enters an endless
+    // bootloop. The reason for the bootloop is as follows.
+    // 1. The CPU tries to write to 0xdeadbeef which causes a page fault.
+    // 2. The CPU looks at the corresponding entru in in the IDT and sees that
+    //    there is no handler and a double fault occurs.
+    // 3. The CPU loos at the IDT entry of the double fault handler,
+    //    but this entry does not specify a handler function either. Thus, a triple fault occurs.
+    // 4. A triple fault is fatal. QEMU reacts to it like most real hardware
+    //    by resetting the system. This causes the endless bootloop.
+    //
+    // The code below is for simulating a page fault.
+    //
+    //unsafe {
+    //    *(0xdeadbeef as *mut u8) = 42;
+    //};
+
+    // The code at the end of this comment is for simulating
+    // a stack overflow.
+    // fn stack_overflow() {
+    //    stack_overflow();
+    //}
+
+
+    // Trigger a stackoverflow
+    //stack_overflow();
+
+    
     // invoke a breakpoint exception
     x86_64::instructions::interrupts::int3();
 

@@ -24,10 +24,10 @@
 #![reexport_test_harness_main = "test_main"]
 
 // Bring our two modules into scope so the rest of the kernel can use them.
+pub mod gdt;
 pub mod interrupts;
 pub mod serial;
 pub mod vga_buffer;
-
 use core::panic::PanicInfo;
 
 // ------------------------------------------------------------------
@@ -140,5 +140,6 @@ pub fn exit_qemu(exit_code: QemuExitCode) {
 }
 
 pub fn init() {
+    gdt::init();
     interrupts::init_idt();
 }

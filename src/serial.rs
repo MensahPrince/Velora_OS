@@ -68,7 +68,7 @@ macro_rules! serial_print {
     // format_args!() builds a formatted argument object without allocating memory.
     // $crate ensures this resolves to our crate regardless of where the macro is called.
     ($($arg:tt)*) => {
-        $crate::serial::_print(format_args!($($arg)*));
+        $crate::serial::_print(core::format_args!($($arg)*));
     };
 }
 
