@@ -79,7 +79,7 @@ pub fn test_panic_handler(info: &PanicInfo) -> ! {
     serial_println!("[failed]\n");
     serial_println!("Error: {}\n", info);
     exit_qemu(QemuExitCode::Failed);
-    loop {} // loop forever — required because -> ! means this never returns
+    hlt_loop() // loop forever — required because -> ! means this never returns
 }
 
 // ------------------------------------------------------------------
@@ -94,7 +94,7 @@ pub fn test_panic_handler(info: &PanicInfo) -> ! {
 pub extern "C" fn _start() -> ! {
     // extern "C" because the bootloader calls us using C calling conventions
     test_main(); // run all the tests
-    loop {}
+    hlt_loop();
 }
 
 // Panic handler for test mode.
@@ -142,4 +142,13 @@ pub fn exit_qemu(exit_code: QemuExitCode) {
 pub fn init() {
     gdt::init();
     interrupts::init_idt();
+    unsafe{ interrupts::PICS.lock().initialize();
+    x86_64::instructions::interrupts::enable();
+    }
+}
+
+pub fn hlt_loop() -> ! {
+    loop {
+        x86_64::instructions::hlt();
+    }
 }

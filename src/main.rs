@@ -85,7 +85,7 @@ pub extern "C" fn _start() -> ! {
 
     // Loop forever — the kernel must never stop running
     println!("VeloraOS did not crash");
-    loop {}
+    velora_os::hlt_loop();
 }
 
 // ------------------------------------------------------------------
@@ -98,12 +98,8 @@ pub extern "C" fn _start() -> ! {
 #[cfg(not(test))]
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    // Print the panic info to screen so we can see what went wrong.
-    // PanicInfo contains the error message and the file/line where it happened.
     println!("{}", info);
-
-    // Loop forever — we can't recover from a kernel panic, just freeze.
-    loop {}
+    velora_os::hlt_loop();
 }
 
 // This panic handler runs during tests.

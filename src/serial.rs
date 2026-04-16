@@ -39,21 +39,22 @@ lazy_static! {
     };
 }
 
-// _print — the actual function that writes to the serial port.
-// Both serial_print! and serial_println! macros call this.
-// #[doc(hidden)] hides it from documentation — it's an internal detail.
 #[doc(hidden)]
 pub fn _print(args: ::core::fmt::Arguments) {
     use core::fmt::Write;
+    use x86_64::instructions::interrupts;
 
-    // Lock the serial port (so nothing else can write at the same time)
-    // then write the formatted arguments to it.
-    // .expect() panics with a message if the write fails.
-    SERIAL1
-        .lock()
-        .write_fmt(args)
-        .expect("Printing to serial failed");
+    // We use interrupts::without_interrupts to avoid deadlocks.
+    // If an interrupt occurred while we have the serial port locked,
+    // and the handler also tried to write to serial, it would hang forever.
+    interrupts::without_interrupts(|| {
+        SERIAL1
+            .lock()
+            .write_fmt(args)
+            .expect("Printing to serial failed");
+    });
 }
+
 
 
 // ------------------------------------------------------------------
@@ -88,3 +89,5 @@ macro_rules! serial_println {
     ($fmt:expr, $($arg:tt)*) => ($crate::serial_print!(
         concat!($fmt, "\n"), $($arg)*));
 }
+
+

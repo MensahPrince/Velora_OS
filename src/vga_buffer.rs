@@ -21,7 +21,6 @@ use spin::Mutex;
 // raw pointer (0xb8000) which Rust can't set up at compile time.
 use lazy_static::lazy_static;
 
-
 // ------------------------------------------------------------------
 // COLOR SYSTEM
 // ------------------------------------------------------------------
@@ -29,7 +28,6 @@ use lazy_static::lazy_static;
 // #[allow(dead_code)] — Rust warns you if you define something and never use it.
 // We define all 16 colors but might not use all of them, so we silence the warning.
 #[allow(dead_code)]
-
 // #[derive(...)] — Rust auto-generates these abilities for our Color type:
 //   Debug     → lets us print it with {:?} for debugging
 //   Clone     → lets us make a copy with .clone()
@@ -37,7 +35,6 @@ use lazy_static::lazy_static;
 //   PartialEq → lets us compare with ==
 //   Eq        → stronger version of PartialEq
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-
 // #[repr(u8)] — store each Color variant as a u8 (1 byte).
 // This matters because VGA hardware expects colors as numbers 0-15.
 // Without this, Rust might store the enum differently.
@@ -67,7 +64,6 @@ pub enum Color {
 //   bits 4-6 → background color (3 bits = 8 colors)
 //   bit  7   → blink
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-
 // #[repr(transparent)] — makes ColorCode have the exact same memory layout as u8.
 // This means ColorCode(5u8) takes up exactly 1 byte, just like a raw u8 would.
 // We need this so ScreenChar's two fields sit perfectly side by side in memory.
@@ -97,7 +93,6 @@ impl ColorCode {
     }
 }
 
-
 // ------------------------------------------------------------------
 // SCREEN CHARACTER — one cell on the screen
 // ------------------------------------------------------------------
@@ -107,16 +102,14 @@ impl ColorCode {
 //   byte 1 → the character (ASCII)
 //   byte 2 → the color code (foreground + background + blink)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-
 // #[repr(C)] — lay out fields in the exact order written, like C does.
 // Without this, Rust might reorder the fields for optimization,
 // which would break things because VGA hardware expects char first, color second.
 #[repr(C)]
 struct ScreenChar {
-    ascii_character: u8,  // the character to display
+    ascii_character: u8,   // the character to display
     color_code: ColorCode, // its color
 }
-
 
 // ------------------------------------------------------------------
 // THE BUFFER — the full screen (25 rows × 80 columns)
@@ -135,7 +128,6 @@ struct Buffer {
     chars: [[Volatile<ScreenChar>; BUFFER_WIDTH]; BUFFER_HEIGHT],
 }
 
-
 // ------------------------------------------------------------------
 // THE WRITER — our "marker" that writes to the screen
 // ------------------------------------------------------------------
@@ -143,10 +135,10 @@ struct Buffer {
 // Writer keeps track of where we are on screen and handles all writing.
 // Think of it as a person holding a marker at a specific position on the whiteboard.
 pub struct Writer {
-    column_position: usize,      // which column we're currently at (0-79)
-    color_code: ColorCode,       // what color we're writing in
+    column_position: usize, // which column we're currently at (0-79)
+    color_code: ColorCode,  // what color we're writing in
     buffer: &'static mut Buffer, // the whiteboard we're writing on (lives at 0xb8000)
-    // 'static means this reference is valid for the entire program runtime
+                            // 'static means this reference is valid for the entire program runtime
 }
 
 impl Writer {
@@ -232,7 +224,6 @@ impl Writer {
     }
 }
 
-
 // ------------------------------------------------------------------
 // FORMATTING SUPPORT — makes println! work
 // ------------------------------------------------------------------
@@ -252,7 +243,6 @@ impl fmt::Write for Writer {
         Ok(())
     }
 }
-
 
 // ------------------------------------------------------------------
 // GLOBAL WRITER — one shared Writer for the whole kernel
@@ -276,7 +266,6 @@ lazy_static! {
     });
 }
 
-
 // ------------------------------------------------------------------
 // MACROS — the println! and print! you use everywhere
 // ------------------------------------------------------------------
@@ -298,16 +287,18 @@ macro_rules! println {
     ($($arg:tt)*) => ($crate::print!("{}\n", format_args!($($arg)*)));
 }
 
-// _print — the actual function both macros call
-// It locks the global WRITER (so nothing else can write at the same time)
-// then uses write_fmt (given to us by fmt::Write) to print the formatted text.
-// #[doc(hidden)] hides this from documentation — it's an internal detail
 #[doc(hidden)]
 pub fn _print(args: fmt::Arguments) {
     use core::fmt::Write;
-    WRITER.lock().write_fmt(args).unwrap();
-}
+    use x86_64::instructions::interrupts;
 
+    // We use interrupts::without_interrupts to avoid deadlocks.
+    // If an interrupt occurred while we have the WRITER locked,
+    // and the handler also tried to write to the screen, it would hang forever.
+    interrupts::without_interrupts(|| {
+        WRITER.lock().write_fmt(args).unwrap();
+    });
+}
 
 // ------------------------------------------------------------------
 // TESTS
@@ -332,11 +323,16 @@ fn test_println_many() {
 // (because println adds a newline, pushing it one row up from the bottom).
 #[test_case]
 fn test_println_output() {
+    use core::fmt::Write;
+    use x86_64::instructions::interrupts;
+
     let s = "Some test string that fits on a single line";
-    println!("{}", s);
-    for (i, c) in s.chars().enumerate() {
-        // Read each character directly from VGA buffer and compare
-        let screen_char = WRITER.lock().buffer.chars[BUFFER_HEIGHT - 2][i].read();
-        assert_eq!(char::from(screen_char.ascii_character), c);
-    }
+    interrupts::without_interrupts(|| {
+        let mut writer = WRITER.lock();
+        writeln!(writer, "\n{}", s).expect("writeln failed");
+        for (i, c) in s.chars().enumerate() {
+            let screen_char = writer.buffer.chars[BUFFER_HEIGHT - 2][i].read();
+            assert_eq!(char::from(screen_char.ascii_character), c);
+        }
+    });
 }
