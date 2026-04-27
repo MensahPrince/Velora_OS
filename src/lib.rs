@@ -159,3 +159,7 @@ pub fn hlt_loop() -> ! {
         x86_64::instructions::hlt();
     }
 }
+
+extern crate alloc;
+
+pub mod allocator;
