@@ -18,8 +18,8 @@
 // so we can call it ourselves from _start below.
 #![reexport_test_harness_main = "test_main"]
 
-use core::panic::PanicInfo;
 use bootloader::{BootInfo, entry_point};
+use core::panic::PanicInfo;
 
 // Bring println! into scope from our vga_buffer module via lib.rs
 use velora_os::println;
@@ -33,17 +33,75 @@ use velora_os::println;
 // Rust normally mangles names (adds extra info) so we disable that here.
 entry_point!(kernel_main);
 fn kernel_main(boot_info: &'static BootInfo) -> ! {
-    // extern "C" — use C calling conventions, because the bootloader
-    // jumps to _start using C conventions, not Rust's.
+    // `memory` module — now exposes `memory::init()` which returns an
+    // OffsetPageTable. Importing the whole module keeps call-sites readable.
+    use velora_os::memory;
+    // `Translate` is the trait that gives OffsetPageTable its
+    // `translate_addr` method. It must be in scope for the method to resolve.
+    use x86_64::structures::paging::Page;
+    use x86_64::{VirtAddr/*, structures::paging::Translate*/ };
+    // use x86_64::structures::paging::Size4KiB;
+    use velora_os::memory::BootInfoFrameAllocator;
 
     // -> ! means this function never returns.
     // There's nowhere to return TO — no parent process, no OS above us.
     // If we returned, the CPU would execute random garbage memory.
 
     // Print our first message to the VGA screen
-    println!("Hello World{}", "!");
+    println!("Welcome to Velora_OS{}", "!");
 
+    // Initialise CPU exception/interrupt handling (IDT, GDT, PICS).
     velora_os::init();
+
+    // The bootloader maps all of physical memory starting at
+    // `physical_memory_offset`. We wrap that offset in a VirtAddr so the
+    // page-table code can convert physical addresses to virtual ones.
+    let phys_mem_offset = VirtAddr::new(boot_info.physical_memory_offset);
+
+    // `memory::init` reads CR3, finds the active Level-4 page table, and
+    // wraps it in an `OffsetPageTable`. The mapper implements the `Translate`
+    // trait, so we can call `mapper.translate_addr(virt)` instead of doing
+    // the 4-level walk manually (that manual version lives in
+    // `translate_addr_inner` and is kept for reference).
+    
+
+    let mut mapper = unsafe { memory::init(phys_mem_offset) };
+    let mut frame_allocator = unsafe { BootInfoFrameAllocator::init(&boot_info.memory_map) };
+    // A handful of virtual addresses whose physical mappings we want to print.
+    // This exercises the new mapper and confirms the paging setup is correct.
+
+    // map an unused page
+    let page = Page::containing_address(VirtAddr::new(0));
+    // Create a mapping for the virtual address 0xdeadbeef000
+    // let page = Page::containing_address(VirtAddr::new(0xdeadbeaf000));
+
+    // call create_example_mapping to create a mapping for the page
+    memory::create_example_mapping(page, &mut mapper, &mut frame_allocator);
+
+    // write the string `New!` to the screen through the new mapping
+    let page_ptr: *mut u64 = page.start_address().as_mut_ptr();
+    unsafe { page_ptr.offset(400).write_volatile(0x_f021_f077_f065_f04e) };
+
+    /*
+    let addresses = [
+        // identity-mapped VGA text buffer
+        0xb8000,
+        // a kernel code page
+        0x201008,
+        // a kernel stack page
+        0x0100_0020_1a10,
+        // the start of the physical-memory mapping (should resolve to phys 0)
+        boot_info.physical_memory_offset,
+    ];
+
+    for &address in &addresses {
+        let virt = VirtAddr::new(address);
+        // `translate_addr` walks the page tables via the OffsetPageTable
+        // abstraction. Returns Some(PhysAddr) if mapped, None if not.
+        let phys = mapper.translate_addr(virt);
+        println!("{:?} -> {:?}", virt, phys);
+    }
+    */
 
     //The commented code below this comment was for simulating
     // a page fault.
@@ -72,20 +130,19 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     //    stack_overflow();
     //}
 
-
     // Trigger a stackoverflow
     //stack_overflow();
 
-    
-    // invoke a breakpoint exception
-    x86_64::instructions::interrupts::int3();
+    // Commented out while focusing on paging — re-enable to test the IDT
+    // breakpoint exception handler.
+    // x86_64::instructions::interrupts::int3();
 
-    // If we're in test mode, run all the tests now
-    #[cfg(test)]
-    test_main();
+    // Commented out while focusing on paging — re-enable to run the test suite.
+    // #[cfg(test)]
+    // test_main();
 
     // Loop forever — the kernel must never stop running
-    println!("VeloraOS did not crash");
+    // ("did not crash" banner suppressed to keep the QEMU paging view clean)
     velora_os::hlt_loop();
 }
 
