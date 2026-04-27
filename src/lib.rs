@@ -28,6 +28,7 @@ pub mod gdt;
 pub mod interrupts;
 pub mod serial;
 pub mod vga_buffer;
+pub mod memory;
 use core::panic::PanicInfo;
 
 // ------------------------------------------------------------------
@@ -90,8 +91,13 @@ pub fn test_panic_handler(info: &PanicInfo) -> ! {
 // It's our kernel entry point during test runs.
 // It calls test_main() which was renamed from the auto-generated test harness main.
 #[cfg(test)]
-#[unsafe(no_mangle)] // no_mangle so the linker can find "_start" by exact name
-pub extern "C" fn _start() -> ! {
+use bootloader::{entry_point, BootInfo};
+
+#[cfg(test)]
+entry_point!(test_kernel_main);
+
+#[cfg(test)]
+fn test_kernel_main(_boot_info: &'static BootInfo) -> ! {
     // extern "C" because the bootloader calls us using C calling conventions
     test_main(); // run all the tests
     hlt_loop();

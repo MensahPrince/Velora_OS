@@ -19,6 +19,7 @@
 #![reexport_test_harness_main = "test_main"]
 
 use core::panic::PanicInfo;
+use bootloader::{BootInfo, entry_point};
 
 // Bring println! into scope from our vga_buffer module via lib.rs
 use velora_os::println;
@@ -30,8 +31,8 @@ use velora_os::println;
 // #[unsafe(no_mangle)] — keep the function name exactly as "_start".
 // The linker looks for "_start" by name to know where to begin execution.
 // Rust normally mangles names (adds extra info) so we disable that here.
-#[unsafe(no_mangle)]
-pub extern "C" fn _start() -> ! {
+entry_point!(kernel_main);
+fn kernel_main(boot_info: &'static BootInfo) -> ! {
     // extern "C" — use C calling conventions, because the bootloader
     // jumps to _start using C conventions, not Rust's.
 
