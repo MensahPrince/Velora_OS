@@ -78,12 +78,27 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
 
     allocator::init_heap(&mut mapper, &mut frame_allocator).expect("init_heap failed");
 
-    // The heap exists now, so the (heap-allocated) scancode queue can be
-    // created, and it's then safe to let hardware interrupts start firing.
+    // The heap exists now, so the (heap-allocated) scancode queue and the
+    // scheduler's (also heap-backed) ready queue can both be created, and
+    // it's then safe to let hardware interrupts — including the timer,
+    // which now drives preemptive scheduling — start firing.
     velora_os::task::keyboard::init_queue();
+    velora_os::scheduler::init();
     velora_os::enable_interrupts();
 
     run_bringup_demo(&mut mapper, &mut frame_allocator);
+
+    // Two demo kernel threads, to show the scheduler actually preempting:
+    // thread A never yields voluntarily, so it only ever gives up the CPU
+    // when the timer interrupts it; thread B yields explicitly every
+    // iteration instead. Not spawned in test builds — they print forever
+    // in the background, which would race with tests that check exact VGA
+    // buffer contents.
+    #[cfg(not(test))]
+    {
+        velora_os::scheduler::spawn(demo_thread_a);
+        velora_os::scheduler::spawn(demo_thread_b);
+    }
 
     // Commented out while focusing on paging — re-enable to run the test suite.
     #[cfg(test)]
@@ -156,6 +171,38 @@ fn run_bringup_demo(
     println!("current reference count is {}", Rc::strong_count(&cloned_reference));
     core::mem::drop(reference_counted);
     println!("reference count is {} now", Rc::strong_count(&cloned_reference));
+}
+
+// ------------------------------------------------------------------
+// SCHEDULER DEMO THREADS
+// ------------------------------------------------------------------
+
+/// Relies purely on timer-driven preemption — never calls `yield_now()`.
+#[cfg(not(test))]
+fn demo_thread_a() -> ! {
+    let mut n: u64 = 0;
+    loop {
+        println!("[thread A] {}", n);
+        n += 1;
+        for _ in 0..2_000_000 {
+            core::hint::spin_loop();
+        }
+    }
+}
+
+/// Gives up its turn voluntarily every iteration, exercising the
+/// yield_now() path rather than relying only on the timer.
+#[cfg(not(test))]
+fn demo_thread_b() -> ! {
+    let mut n: u64 = 0;
+    loop {
+        println!("[thread B] {}", n);
+        n += 1;
+        for _ in 0..2_000_000 {
+            core::hint::spin_loop();
+        }
+        velora_os::scheduler::yield_now();
+    }
 }
 
 // ------------------------------------------------------------------

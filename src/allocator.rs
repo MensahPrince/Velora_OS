@@ -7,7 +7,11 @@ use linked_list_allocator::LockedHeap;
 static ALLOCATOR: LockedHeap = LockedHeap::empty();
 
 pub const HEAP_START: u64 = 0x4444_4444_0000;
-pub const HEAP_SIZE: u64 = 100 * 1024; // 100 KiB
+// Bumped from the original 100 KiB: two 16 KiB kernel-thread stacks
+// (src/scheduler) plus the scancode/task-executor queues and the boot-time
+// demo allocations no longer fit comfortably in 100 KiB. 1 MiB is still
+// tiny next to real RAM and leaves headroom to spawn more threads later.
+pub const HEAP_SIZE: u64 = 1024 * 1024; // 1 MiB
 
 // in src/allocator.rs
 
