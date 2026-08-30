@@ -15,6 +15,7 @@ use x86_64::registers::control::Cr3;
 
 pub const SYS_WRITE: u64 = 0;
 pub const SYS_READ: u64 = 1;
+pub const SYS_EXIT: u64 = 2;
 
 /// The IDT entry (src/interrupts.rs) points directly at this, via
 /// `Entry::set_handler_addr` rather than `set_handler_fn` — it can't be a
@@ -97,6 +98,12 @@ extern "C" fn dispatch(number: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
     match number {
         SYS_WRITE => sys_write(arg1, arg2, arg3),
         SYS_READ => sys_read(arg1, arg2, arg3),
+        // `scheduler::exit_current_thread()` returns `!`, not `u64` — it
+        // never comes back here to produce a value, the same way it never
+        // comes back to `entry`'s own `call {dispatch}` either (see that
+        // naked_asm's doc comment). Diverging is fine as a match arm: `!`
+        // coerces to whatever type the other arms settle on.
+        SYS_EXIT => scheduler::exit_current_thread(),
         _ => u64::MAX, // unknown syscall
     }
 }

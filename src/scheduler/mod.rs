@@ -53,12 +53,9 @@ struct Thread {
     /// away, and it becomes stale (and unused) the moment this thread is
     /// resumed.
     stack_pointer: u64,
-    /// The thread's dedicated stack. Not read anywhere yet — there's no
-    /// thread-exit support to free it — but kept so that adding cleanup
-    /// later doesn't need any other bookkeeping threaded through first.
-    #[allow(dead_code)]
+    /// The thread's dedicated stack — read back by `reap_zombie()`, once
+    /// this thread has exited, to free it.
     stack_base: *mut u8,
-    #[allow(dead_code)]
     stack_size: usize,
     /// Consumed once, by `thread_trampoline`, the first time this thread
     /// runs. `None` for the boot thread (id 0), which doesn't run through
@@ -141,6 +138,16 @@ struct SchedulerState {
     /// `schedule()` switches CR3 back to this for any thread whose own
     /// `page_table` is `None`.
     kernel_page_table: PhysFrame,
+    /// Set by `exit_current_thread()` to the thread it just switched away
+    /// from for good — its slot in `threads` is still occupied (so its
+    /// `stack_base`/`stack_size` are on hand) but it will never run again.
+    /// `reap_zombie()` frees it and clears this the next time *any* other
+    /// thread reaches a scheduling decision — never here, since a thread
+    /// can't free the stack it's still executing on. At most one pending
+    /// zombie ever exists: `reap_zombie()` runs at the top of both
+    /// `schedule()` and `exit_current_thread()`, so nothing new can be
+    /// switched away from until the previous one is cleared.
+    zombie: Option<ThreadId>,
 }
 
 static SCHEDULER: Mutex<Option<SchedulerState>> = Mutex::new(None);
@@ -174,6 +181,7 @@ pub fn init() {
             ready_queue: ReadyQueue::new(),
             current: 0,
             kernel_page_table,
+            zombie: None,
         });
     });
 }
@@ -391,6 +399,115 @@ pub fn yield_now() {
     schedule();
 }
 
+/// Terminate the calling thread for good: remove it from the round-robin
+/// rotation, switch to another ready thread, and (once it's safe — see
+/// `reap_zombie`) free its kernel stack and reuse its slot in the thread
+/// table. Callable directly by kernel-mode thread bodies, or reached from
+/// ring 3 via the syscall ABI (`syscall::SYS_EXIT` — see src/syscall.rs);
+/// either way this is the only place that actually implements it.
+///
+/// Deliberately doesn't (and, without a frame *deallocator* — this
+/// kernel's `BootInfoFrameAllocator` only ever hands frames out, never
+/// takes them back — structurally can't yet) free the physical frames
+/// backing an isolated thread's own address space (its L4 table, and
+/// whatever `elf::load`/`userspace::map_shellcode_page` mapped into it):
+/// those leak. Reclaiming the kernel stack is the part that's actually
+/// tractable today (it's ordinary heap memory, and this kernel's heap
+/// allocator supports freeing), and the part that matters most in
+/// practice — it's what makes the thread *table slot* reusable, which is
+/// what would otherwise make every process this kernel ever ran a
+/// one-way trip through `MAX_THREADS`.
+///
+/// # Panics
+/// If called by the boot thread (id 0 — `kernel_main` never calls this,
+/// so this should be unreachable) or if no other thread is left in the
+/// ready queue to switch into (unreachable in practice: the boot thread
+/// stays in the rotation for the life of the kernel, so there's always at
+/// least one other thread for any *other* thread to exit into).
+pub fn exit_current_thread() -> ! {
+    reap_zombie();
+
+    interrupts::disable();
+    let mut guard = SCHEDULER.lock();
+    let state = guard.as_mut().expect("scheduler not initialized");
+
+    let id = state.current;
+    assert_ne!(id, 0, "the boot thread can't exit");
+
+    let next = state
+        .ready_queue
+        .pop_front()
+        .expect("exit_current_thread: no other thread left to run");
+    state.current = next;
+    // Not pushed back into ready_queue — that omission is what actually
+    // removes this thread from rotation for good.
+    state.zombie = Some(id);
+
+    let old_stack_slot = {
+        let dying_thread = state.threads[id]
+            .as_mut()
+            .expect("current thread missing from thread table");
+        // Never read again (this thread is never resumed), but switch_to
+        // unconditionally writes through this pointer, so it still has to
+        // point somewhere valid.
+        &mut dying_thread.stack_pointer as *mut u64
+    };
+    let next_thread = state.threads[next]
+        .as_ref()
+        .expect("next thread missing from thread table");
+    let new_stack = next_thread.stack_pointer;
+    let new_page_table = next_thread
+        .page_table
+        .unwrap_or(state.kernel_page_table)
+        .start_address()
+        .as_u64();
+    let new_rsp0 = next_thread.kernel_stack_top;
+
+    unsafe {
+        gdt::set_rsp0(VirtAddr::new(new_rsp0));
+    }
+
+    // Same reasoning as schedule()'s own drop(guard): switch_to leaves via
+    // a raw `ret` that never returns here, so a held guard would never
+    // unlock.
+    drop(guard);
+
+    unsafe {
+        context::switch_to(old_stack_slot, new_stack, new_page_table);
+    }
+
+    // Unlike schedule()'s call to switch_to, this one is never resumed —
+    // this thread's slot is a zombie now, permanently absent from
+    // ready_queue, so nothing will ever switch back into it.
+    unreachable!("exit_current_thread: a thread that already exited was resumed");
+}
+
+/// If a previous call to `exit_current_thread()` left a thread's slot
+/// pending cleanup, free its kernel stack and clear the slot now. Safe to
+/// call unconditionally from here: reaching a scheduling decision at all
+/// means the *previous* zombie's own `switch_to` call already handed
+/// control away for good, so nothing is still executing on the stack this
+/// is about to deallocate.
+///
+/// Runs as its own short lock scope, separate from `schedule()`'s and
+/// `exit_current_thread()`'s own — same reason `spawn()`'s allocation
+/// happens before it takes `SCHEDULER`'s lock: the global allocator has
+/// its own internal lock, and there's no reason to hold two at once
+/// longer than necessary.
+fn reap_zombie() {
+    let dead: Option<Thread> = interrupts::without_interrupts(|| {
+        let mut guard = SCHEDULER.lock();
+        let state = guard.as_mut().expect("scheduler not initialized");
+        let zombie_id = state.zombie.take()?;
+        state.threads[zombie_id].take()
+    });
+
+    if let Some(thread) = dead {
+        let layout = Layout::from_size_align(thread.stack_size, 4096).unwrap();
+        unsafe { alloc::alloc::dealloc(thread.stack_base, layout) };
+    }
+}
+
 /// Pick the next ready thread and switch to it, if there is one besides
 /// the one already running.
 ///
@@ -400,6 +517,8 @@ pub fn yield_now() {
 /// is scheduled back in, possibly much later, so the restore has to happen
 /// *after* that point — see the comment below `switch_to` for why.
 fn schedule() {
+    reap_zombie();
+
     let interrupts_were_enabled = interrupts::are_enabled();
     interrupts::disable();
 

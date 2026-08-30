@@ -218,6 +218,32 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
         }
     }
 
+    // Process lifecycle (src/scheduler.rs's exit_current_thread, reached
+    // here directly since this is a kernel-mode thread; a ring-3 one
+    // would reach the same function via syscall::SYS_EXIT instead):
+    // spawns more short-lived threads, one at a time, than the scheduler's
+    // fixed-size thread table (MAX_THREADS = 16) has slots for. Each one
+    // prints, exits immediately, and is `yield_now()`-ed into and back out
+    // of before the next is spawned — so at most one extra thread is ever
+    // alive at once, and the *next* iteration's `spawn` can only succeed
+    // if the previous thread's slot (and kernel stack) really was freed,
+    // not just marked "done" and left occupied. Without real reclamation
+    // this panics ("thread table full") well before the loop finishes;
+    // unlike the demos above, it's left permanently enabled (not gated by
+    // a `run` flag) since it's finite and quiet rather than printing
+    // forever in the background.
+    #[cfg(not(test))]
+    for i in 0..40u32 {
+        velora_os::scheduler::spawn(exit_demo_thread);
+        velora_os::scheduler::yield_now();
+        if i == 39 {
+            println!(
+                "scheduler: spawned and exited 40 threads through a 16-slot table \
+                 without exhausting it — exit reclamation works"
+            );
+        }
+    }
+
     // Commented out while focusing on paging — re-enable to run the test suite.
     #[cfg(test)]
     test_main();
@@ -306,6 +332,16 @@ fn demo_thread_a() -> ! {
             core::hint::spin_loop();
         }
     }
+}
+
+/// Spawned repeatedly by the process-lifecycle demo in `kernel_main` — see
+/// its comment there. Runs once, prints, and exits for good via
+/// `scheduler::exit_current_thread()`: unlike every other demo thread in
+/// this file, this one is meant to actually finish.
+#[cfg(not(test))]
+fn exit_demo_thread() -> ! {
+    println!("[exit demo] running, exiting now");
+    velora_os::scheduler::exit_current_thread();
 }
 
 /// Gives up its turn voluntarily every iteration, exercising the
