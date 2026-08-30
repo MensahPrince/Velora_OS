@@ -29,6 +29,8 @@ pub mod interrupts;
 pub mod serial;
 pub mod vga_buffer;
 pub mod memory;
+pub mod task;
+pub mod scheduler;
 use core::panic::PanicInfo;
 
 
@@ -146,12 +148,25 @@ pub fn exit_qemu(exit_code: QemuExitCode) {
     }
 }
 
+/// Load the GDT/IDT and remap the PICs. CPU exceptions (breakpoint, page
+/// fault, ...) work immediately after this, since they aren't gated by the
+/// interrupt flag. Hardware IRQs (timer, keyboard, ...) stay masked off
+/// until `enable_interrupts()` is called separately: anything an ISR might
+/// touch — like the heap-allocated keyboard scancode queue — has to exist
+/// first, and the heap isn't set up yet at this point in boot.
 pub fn init() {
     gdt::init();
     interrupts::init_idt();
     unsafe {
         interrupts::PICS.lock().initialize();
     }
+}
+
+/// Unmask hardware interrupts (the `sti` instruction). Call only once
+/// everything an ISR could touch — the heap, the keyboard scancode queue —
+/// is ready; otherwise a keystroke arriving early can hit an uninitialized
+/// resource.
+pub fn enable_interrupts() {
     x86_64::instructions::interrupts::enable();
 }
 
