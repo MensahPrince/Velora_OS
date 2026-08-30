@@ -1,4 +1,4 @@
-use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame};
+use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
 
 use crate::println;
 use lazy_static::lazy_static;
@@ -13,8 +13,10 @@ lazy_static! {
         idt.breakpoint.set_handler_fn(breakpoint_handler);
         unsafe {
             idt.double_fault.set_handler_fn(double_fault_handler)
-                .set_stack_index(gdt::DOUBLE_FAULT_IST_INDEX); 
+                .set_stack_index(gdt::DOUBLE_FAULT_IST_INDEX);
         }
+        idt.page_fault.set_handler_fn(page_fault_handler);
+        idt.general_protection_fault.set_handler_fn(general_protection_fault_handler);
         idt[InterruptIndex::Timer.as_usize()].set_handler_fn(timer_interrupt_handler);
         idt[InterruptIndex::Keyboard.as_usize()].set_handler_fn(keyboard_interrupt_handler);
 
@@ -56,6 +58,34 @@ extern "x86-interrupt" fn double_fault_handler(
     _error_code: u64,
 ) -> ! {
     panic!("EXCEPTION: DOUBLE FAULT\n{:#?}", stack_frame);
+}
+
+// Without this, any page fault (a bad pointer, a missing mapping — exactly
+// what per-process page tables will make more common) hits an empty IDT
+// slot, double-faults, and reboots with no diagnostic. CR2 holds the
+// address that was actually accessed when the fault happened.
+extern "x86-interrupt" fn page_fault_handler(
+    stack_frame: InterruptStackFrame,
+    error_code: PageFaultErrorCode,
+) {
+    use x86_64::registers::control::Cr2;
+
+    panic!(
+        "EXCEPTION: PAGE FAULT\nAccessed Address: {:?}\nError Code: {:?}\n{:#?}",
+        Cr2::read(),
+        error_code,
+        stack_frame
+    );
+}
+
+extern "x86-interrupt" fn general_protection_fault_handler(
+    stack_frame: InterruptStackFrame,
+    error_code: u64,
+) {
+    panic!(
+        "EXCEPTION: GENERAL PROTECTION FAULT\nError Code: {:#x}\n{:#?}",
+        error_code, stack_frame
+    );
 }
 
 // IPC Interrupts

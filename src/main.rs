@@ -55,7 +55,10 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     // Print our first message to the VGA screen
     println!("Welcome to Velora_OS{}", "!");
 
-    // Initialise CPU exception/interrupt handling (IDT, GDT, PICS).
+    // Load the GDT/IDT and remap the PICs. Hardware interrupts (timer,
+    // keyboard) stay masked until we explicitly enable them further down —
+    // once the heap and the scancode queue that the keyboard ISR feeds are
+    // actually ready for it.
     velora_os::init();
 
     // The bootloader maps all of physical memory starting at
@@ -76,6 +79,12 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     // This exercises the new mapper and confirms the paging setup is correct.
 
     allocator::init_heap(&mut mapper, &mut frame_allocator).expect("init_heap failed");
+
+    // The heap exists now, so the (heap-allocated) scancode queue can be
+    // created, and it's then safe to let hardware interrupts start firing.
+    velora_os::task::keyboard::init_queue();
+    velora_os::enable_interrupts();
+
     // Map an unused page to the VGA text buffer frame, purely as a demo of
     // `mapper.map_to`. Deliberately NOT the null page (address 0) — mapping
     // page 0 would remove the usual guarantee that a null-pointer write

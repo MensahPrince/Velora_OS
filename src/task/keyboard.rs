@@ -46,15 +46,25 @@ pub(crate) fn add_scancode(scancode: u8) {
     }
 }
 
+/// Create the scancode queue. Must be called once, before interrupts are
+/// enabled (i.e. before `velora_os::init()`), so the keyboard ISR never
+/// fires against an uninitialized queue and silently drops a keystroke.
+pub fn init_queue() {
+    SCANCODE_QUEUE
+        .try_init_once(|| ArrayQueue::new(100))
+        .expect("keyboard::init_queue should only be called once");
+}
+
 pub struct ScancodeStream {
     _private: (),
 }
 
 impl ScancodeStream {
     pub fn new() -> Self {
-        SCANCODE_QUEUE
-            .try_init_once(|| ArrayQueue::new(100))
-            .expect("ScancodeStream::new should only be called once");
+        debug_assert!(
+            SCANCODE_QUEUE.is_initialized(),
+            "keyboard::init_queue() must be called before ScancodeStream::new()"
+        );
         ScancodeStream { _private: () }
     }
 }
