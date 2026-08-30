@@ -31,6 +31,7 @@ pub mod vga_buffer;
 pub mod memory;
 pub mod task;
 pub mod scheduler;
+pub mod userspace;
 use core::panic::PanicInfo;
 
 

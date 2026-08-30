@@ -43,7 +43,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     // `memory` module — now exposes `memory::init()` which returns an
     // OffsetPageTable. Importing the whole module keeps call-sites readable.
     use velora_os::memory;
-    use x86_64::{VirtAddr/*, structures::paging::Translate*/ };
+    use x86_64::VirtAddr;
     use velora_os::allocator; // import the new allocator module
 
     // -> ! means this function never returns.
@@ -98,6 +98,43 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     if false {
         velora_os::scheduler::spawn(demo_thread_a);
         velora_os::scheduler::spawn(demo_thread_b);
+    }
+
+    // Ring 3 (user-mode) demo: map a small hand-written shellcode page,
+    // then spawn a thread that drops into it and runs it at CPL 3 — see
+    // src/userspace.rs. Not spawned in test builds, same reasoning as the
+    // scheduler demo threads above: it prints in the background, which
+    // would race with tests that check exact VGA buffer contents.
+    //
+    // Disabled for now: this and the isolated demo below both drop a
+    // thread into ring 3, and both ring3<->ring0 transitions go through
+    // the single shared RSP0 stack (see the TSS setup in src/gdt.rs) —
+    // which is only sound with one ring-3 thread at a time. Running both
+    // concurrently is under investigation; re-enable once RSP0 is
+    // per-thread (or some other fix lands) rather than a single static.
+    #[cfg(not(test))]
+    if false {
+        velora_os::userspace::map_demo_page(&mut mapper, phys_mem_offset, &mut frame_allocator);
+        velora_os::scheduler::spawn(velora_os::userspace::run_demo);
+    }
+
+    // Real process isolation: the same demo, but running in its own
+    // address space rather than the kernel's shared one — see
+    // src/userspace.rs and src/memory.rs (`new_address_space`). Proven by
+    // checking, right here, in the *kernel's own* page tables, whether the
+    // isolated demo's page is visible at all.
+    #[cfg(not(test))]
+    {
+        use x86_64::structures::paging::Translate;
+
+        velora_os::userspace::spawn_isolated_demo(&mut mapper, phys_mem_offset, &mut frame_allocator);
+
+        let isolated_addr = VirtAddr::new(velora_os::userspace::ISOLATED_USER_PAGE_ADDR);
+        println!(
+            "kernel's own view of the isolated demo's page: {:?} (should be None — \
+             it's only mapped in that demo's own address space)",
+            mapper.translate_addr(isolated_addr)
+        );
     }
 
     // Commented out while focusing on paging — re-enable to run the test suite.

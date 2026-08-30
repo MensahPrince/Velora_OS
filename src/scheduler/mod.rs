@@ -9,16 +9,25 @@
 // thread (see kernel_main) — its `print_keypresses` task and friends keep
 // working exactly as before, just now preemptible like everything else.
 //
-// Still ring 0 only: every thread shares the kernel's single address space
-// and page table. Real process isolation needs ring 3 execution and a
-// separate address space per process on top of this, not instead of it.
+// Threads are ring 0 only by default, but a thread can instead be given its
+// own address space (`spawn_isolated`) — a genuinely separate set of page
+// tables, not just a lower privilege level — which `schedule()` switches
+// CR3 to whenever that thread runs. See src/userspace.rs for what actually
+// runs inside one.
 // ============================================================
 
 mod context;
 
-use alloc::{alloc::Layout, collections::VecDeque};
+use alloc::alloc::Layout;
 use spin::Mutex;
-use x86_64::instructions::interrupts;
+use x86_64::{
+    VirtAddr,
+    instructions::interrupts,
+    registers::control::Cr3,
+    structures::paging::{
+        FrameAllocator, Mapper, OffsetPageTable, Page, PageTableFlags, PhysFrame, Size4KiB,
+    },
+};
 
 /// How many kernel threads can exist at once, including the boot thread
 /// (id 0). Fixed-size rather than a growable map so nothing here needs to
@@ -30,6 +39,9 @@ const MAX_THREADS: usize = 16;
 /// kernel spawns (a loop, a println!, a spin-wait); revisit if threads
 /// start doing deep recursion. Kept modest since the heap itself is only
 /// 1 MiB (see src/allocator.rs) — each thread's stack comes out of it.
+/// A multiple of 4096: stacks are allocated page-aligned (see `spawn`),
+/// which `spawn_isolated` relies on to map a precise, non-overlapping
+/// range of whole pages into an isolated address space.
 const STACK_SIZE: usize = 16 * 1024;
 
 pub type ThreadId = usize;
@@ -51,6 +63,55 @@ struct Thread {
     /// runs. `None` for the boot thread (id 0), which doesn't run through
     /// the trampoline — it's already executing when `init()` registers it.
     entry: Option<fn() -> !>,
+    /// `Some(l4_frame)` for a thread spawned via `spawn_isolated` — its own
+    /// dedicated address space, switched to via CR3 whenever this thread
+    /// runs. `None` means "the shared kernel address space every ordinary
+    /// thread uses" (`SchedulerState::kernel_page_table`).
+    page_table: Option<PhysFrame>,
+}
+
+/// A fixed-capacity FIFO of thread ids — deliberately not a heap-backed
+/// `VecDeque`. `schedule()` runs from inside the timer ISR, which can fire
+/// with *any* thread's address space active (interrupts don't switch CR3
+/// on their own — see `context::switch_to`'s doc comment), including an
+/// isolated one that doesn't map the kernel heap at all. A `VecDeque`'s
+/// struct (pointer/len/cap) would still live in this static (so, always
+/// reachable), but the actual buffer it points to would not be — so
+/// touching it while an isolated address space is active would fault
+/// exactly like any other access to unmapped memory. Every element instead
+/// lives inline, right here, in the same static as everything else
+/// `schedule()` touches.
+struct ReadyQueue {
+    ids: [ThreadId; MAX_THREADS],
+    head: usize,
+    len: usize,
+}
+
+impl ReadyQueue {
+    const fn new() -> Self {
+        ReadyQueue {
+            ids: [0; MAX_THREADS],
+            head: 0,
+            len: 0,
+        }
+    }
+
+    fn push_back(&mut self, id: ThreadId) {
+        assert!(self.len < MAX_THREADS, "ready queue full");
+        let index = (self.head + self.len) % MAX_THREADS;
+        self.ids[index] = id;
+        self.len += 1;
+    }
+
+    fn pop_front(&mut self) -> Option<ThreadId> {
+        if self.len == 0 {
+            return None;
+        }
+        let id = self.ids[self.head];
+        self.head = (self.head + 1) % MAX_THREADS;
+        self.len -= 1;
+        Some(id)
+    }
 }
 
 // `Thread` holds a raw pointer (`stack_base`), which by default makes it
@@ -60,15 +121,19 @@ unsafe impl Send for Thread {}
 
 struct SchedulerState {
     threads: [Option<Thread>; MAX_THREADS],
-    ready_queue: VecDeque<ThreadId>,
+    ready_queue: ReadyQueue,
     current: ThreadId,
+    /// The L4 frame that was active when `init()` ran — i.e. the shared
+    /// address space every ordinary (non-isolated) thread runs under.
+    /// `schedule()` switches CR3 back to this for any thread whose own
+    /// `page_table` is `None`.
+    kernel_page_table: PhysFrame,
 }
 
 static SCHEDULER: Mutex<Option<SchedulerState>> = Mutex::new(None);
 
 /// Register the currently executing context as thread 0 and bring the
-/// scheduler up. Must be called once, after the heap is ready (the ready
-/// queue is heap-allocated) and before `spawn` or `tick`.
+/// scheduler up. Must be called once, before `spawn` or `tick`.
 pub fn init() {
     let threads: [Option<Thread>; MAX_THREADS] = core::array::from_fn(|i| {
         if i == 0 {
@@ -81,6 +146,7 @@ pub fn init() {
                 stack_base: core::ptr::null_mut(),
                 stack_size: 0,
                 entry: None,
+                page_table: None,
             })
         } else {
             None
@@ -88,19 +154,31 @@ pub fn init() {
     });
 
     interrupts::without_interrupts(|| {
+        let (kernel_page_table, _) = Cr3::read();
         *SCHEDULER.lock() = Some(SchedulerState {
             threads,
-            // Reserved once, up front, so `schedule()` (which runs inside
-            // the timer ISR) never needs to grow this — growing would mean
-            // calling into the global heap allocator's own spinlock from
-            // interrupt context, which could deadlock against a thread
-            // that got interrupted mid-allocation elsewhere. At most
-            // MAX_THREADS ids are ever queued at once, so this capacity is
-            // always enough.
-            ready_queue: VecDeque::with_capacity(MAX_THREADS),
+            ready_queue: ReadyQueue::new(),
             current: 0,
+            kernel_page_table,
         });
     });
+}
+
+/// The shared kernel address space's L4 frame — the one every ordinary
+/// (non-isolated) thread runs under. Interrupt handlers that touch
+/// heap-backed state (e.g. the keyboard handler, src/interrupts.rs) need
+/// this: such a handler can run with *any* thread's address space active,
+/// since interrupts don't care what was interrupted, so it has to force
+/// its way back to an address space where the heap is actually mapped
+/// before touching anything heap-backed.
+pub fn kernel_page_table() -> PhysFrame {
+    interrupts::without_interrupts(|| {
+        SCHEDULER
+            .lock()
+            .as_ref()
+            .expect("scheduler not initialized")
+            .kernel_page_table
+    })
 }
 
 /// Spawn a new kernel thread running `entry` (which must never return —
@@ -113,7 +191,7 @@ pub fn spawn(entry: fn() -> !) {
     // code trying to lock it too (see the ready_queue capacity note in
     // `init`).
     interrupts::without_interrupts(|| {
-        let layout = Layout::from_size_align(STACK_SIZE, 16).unwrap();
+        let layout = Layout::from_size_align(STACK_SIZE, 4096).unwrap();
         let stack_base = unsafe { alloc::alloc::alloc(layout) };
         assert!(!stack_base.is_null(), "kernel thread stack allocation failed");
         let stack_pointer = unsafe { build_initial_stack(stack_base) };
@@ -134,6 +212,84 @@ pub fn spawn(entry: fn() -> !) {
             stack_base,
             stack_size: STACK_SIZE,
             entry: Some(entry),
+            page_table: None,
+        });
+        state.ready_queue.push_back(id);
+    });
+}
+
+/// Like `spawn`, but the new thread gets its own address space
+/// (`page_table`, an L4 frame built by `memory::new_address_space`)
+/// instead of the shared kernel one — `schedule()` switches CR3 to it
+/// whenever this thread runs. See src/userspace.rs for the actual ring-3
+/// program that runs inside one.
+///
+/// `kernel_mapper` is the caller's own (shared, currently active) mapper;
+/// `isolated_mapper` is the one `memory::new_address_space` handed back
+/// alongside `page_table`, for mapping pages into the new space before
+/// anything runs under it.
+pub fn spawn_isolated(
+    entry: fn() -> !,
+    page_table: PhysFrame,
+    kernel_mapper: &mut OffsetPageTable,
+    isolated_mapper: &mut OffsetPageTable,
+    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
+) {
+    interrupts::without_interrupts(|| {
+        let layout = Layout::from_size_align(STACK_SIZE, 4096).unwrap();
+        let stack_base = unsafe { alloc::alloc::alloc(layout) };
+        assert!(!stack_base.is_null(), "kernel thread stack allocation failed");
+        let stack_pointer = unsafe { build_initial_stack(stack_base) };
+
+        // This thread's kernel-mode stack lives in the shared kernel heap,
+        // which the isolated address space otherwise can't see at all —
+        // that's the whole point of it being isolated. But its own
+        // ring-0-side code (thread_trampoline, and whatever setup it does
+        // before dropping to ring 3) still needs it, and so does resuming
+        // correctly if a timer interrupt preempts it before it gets that
+        // far (see the CR3 handling in `schedule()` below). So the exact
+        // same physical frames get mapped at the exact same virtual
+        // addresses in the isolated table too — kernel-only, not
+        // USER_ACCESSIBLE, so ring-3 code running in this same address
+        // space still can't reach it, only ring-0 code under this CR3 can.
+        let stack_start = VirtAddr::from_ptr(stack_base);
+        let first_page = Page::<Size4KiB>::containing_address(stack_start);
+        let page_count = STACK_SIZE / 4096;
+        for i in 0..page_count as u64 {
+            let page = first_page + i;
+            let frame = kernel_mapper
+                .translate_page(page)
+                .expect("thread stack page vanished right after being allocated");
+            unsafe {
+                isolated_mapper
+                    .map_to(
+                        page,
+                        frame,
+                        PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
+                        frame_allocator,
+                    )
+                    .expect("failed to share a thread stack page into its isolated address space")
+                    .flush();
+            }
+        }
+
+        let mut guard = SCHEDULER.lock();
+        let state = guard
+            .as_mut()
+            .expect("scheduler::init must be called before spawn_isolated");
+
+        let id = state
+            .threads
+            .iter()
+            .position(Option::is_none)
+            .expect("thread table full (MAX_THREADS exceeded)");
+
+        state.threads[id] = Some(Thread {
+            stack_pointer,
+            stack_base,
+            stack_size: STACK_SIZE,
+            entry: Some(entry),
+            page_table: Some(page_table),
         });
         state.ready_queue.push_back(id);
     });
@@ -266,10 +422,15 @@ fn schedule() {
             .expect("current thread missing from thread table");
         &mut previous_thread.stack_pointer as *mut u64
     };
-    let new_stack = state.threads[next]
+    let next_thread = state.threads[next]
         .as_ref()
-        .expect("next thread missing from thread table")
-        .stack_pointer;
+        .expect("next thread missing from thread table");
+    let new_stack = next_thread.stack_pointer;
+    let new_page_table = next_thread
+        .page_table
+        .unwrap_or(state.kernel_page_table)
+        .start_address()
+        .as_u64();
 
     // Unlock before the switch: holding a spin::Mutex guard across
     // switch_to would deadlock the first time anything tried to lock
@@ -282,7 +443,7 @@ fn schedule() {
     drop(guard);
 
     unsafe {
-        context::switch_to(old_stack_slot, new_stack);
+        context::switch_to(old_stack_slot, new_stack, new_page_table);
     }
 
     // Execution only reaches here once this exact thread has been
