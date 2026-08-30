@@ -148,6 +148,23 @@ impl Writer {
             // If the byte is a newline character, move to the next line
             b'\n' => self.new_line(),
 
+            // Backspace: step the column back and blank the cell there.
+            // Only handles the current line — there's no record of how long
+            // the previous line was, so backspacing past column 0 is simply
+            // a no-op rather than wrapping up to the row above.
+            0x08 => {
+                if self.column_position > 0 {
+                    self.column_position -= 1;
+                    let row = BUFFER_HEIGHT - 1;
+                    let col = self.column_position;
+                    let blank = ScreenChar {
+                        ascii_character: b' ',
+                        color_code: self.color_code,
+                    };
+                    self.buffer.chars[row][col].write(blank);
+                }
+            }
+
             // For any other byte, write it to the screen
             byte => {
                 // If we've reached the end of the line (column 80), wrap to next line
@@ -182,9 +199,9 @@ impl Writer {
     pub fn write_string(&mut self, s: &str) {
         for c in s.chars() {
             match c {
-                // Only write printable ASCII characters (space=0x20 to tilde=0x7e) and newlines.
-                // VGA hardware only understands ASCII + code page 437.
-                ' '..='~' | '\n' => self.write_byte(c as u8),
+                // Only write printable ASCII characters (space=0x20 to tilde=0x7e), newlines,
+                // and backspace. VGA hardware only understands ASCII + code page 437.
+                ' '..='~' | '\n' | '\u{8}' => self.write_byte(c as u8),
 
                 // For anything outside that range (like non-ASCII characters),
                 // print ■ (0xfe) as a placeholder — VGA can't display them.
@@ -319,6 +336,32 @@ fn test_println_many() {
     for _ in 0..200 {
         println!("test_println_many output");
     }
+}
+
+// Backspace test — writing a character then backspace should leave the
+// cell blank and the cursor back where the character was, and backspacing
+// at column 0 should be a harmless no-op rather than underflowing.
+#[test_case]
+fn test_backspace_erases_last_char() {
+    use x86_64::instructions::interrupts;
+
+    interrupts::without_interrupts(|| {
+        let mut writer = WRITER.lock();
+        writer.new_line(); // start on a fresh, known-blank line
+        let start_column = writer.column_position;
+
+        writer.write_byte(b'x');
+        writer.write_byte(0x08);
+
+        assert_eq!(writer.column_position, start_column);
+        let row = BUFFER_HEIGHT - 1;
+        let screen_char = writer.buffer.chars[row][start_column].read();
+        assert_eq!(screen_char.ascii_character, b' ');
+
+        // Backspacing again, now at column 0, must not panic or underflow.
+        writer.write_byte(0x08);
+        assert_eq!(writer.column_position, start_column);
+    });
 }
 
 // Correctness test — print a string then verify it actually appears in the VGA buffer.
