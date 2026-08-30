@@ -19,9 +19,10 @@
 // loop through the real syscall ABI, not just a fixed debug print.
 // ============================================================
 
-use crate::{gdt, memory, scheduler, syscall};
+use crate::{elf, gdt, memory, scheduler, syscall};
 use alloc::vec::Vec;
 use core::arch::asm;
+use core::sync::atomic::{AtomicU64, Ordering};
 use x86_64::{
     VirtAddr,
     instructions::segmentation::{DS, ES, FS, GS, Segment},
@@ -247,6 +248,122 @@ pub fn run_demo() -> ! {
 pub fn run_isolated_demo() -> ! {
     let entry = VirtAddr::new(ISOLATED_USER_PAGE_ADDR);
     let stack_top = VirtAddr::new(ISOLATED_USER_PAGE_ADDR + 4096 - 16);
+
+    unsafe {
+        enter_ring3(entry, stack_top);
+    }
+}
+
+/// Where the ELF demo's program gets loaded — another P4 slot nothing
+/// else in this kernel uses. Matters less for collision-avoidance than it
+/// once did (every demo here gets its own address space now), but keeps
+/// things easy to tell apart in diagnostics.
+const ELF_LOAD_ADDR: u64 = 0x7000_0000_0000;
+
+/// Filled in by `spawn_elf_demo` before the thread it spawns ever runs.
+/// `run_elf_demo` is a plain fn pointer (`scheduler::spawn_isolated` can't
+/// carry captured state, the same constraint `run_demo`/`run_isolated_demo`
+/// work around by hardcoding a known constant address) but the stack's
+/// placement is decided dynamically inside `elf::load`, not fixed at
+/// compile time — so it's read back from here instead of being
+/// re-derived by duplicating that placement logic.
+static ELF_DEMO_STACK_TOP: AtomicU64 = AtomicU64::new(0);
+
+/// Wraps the same read/write echo machine code `build_echo_shellcode`
+/// already builds in a minimal, valid ELF64 executable — real headers,
+/// loaded through the real (if narrow) parser in src/elf.rs, rather than
+/// mapped directly the way `run_demo`/`run_isolated_demo` are.
+fn build_test_elf(load_addr: u64) -> Vec<u8> {
+    let payload = build_echo_shellcode(load_addr);
+
+    const EHDR_SIZE: u64 = 64;
+    const PHDR_SIZE: u64 = 56;
+    let payload_offset = EHDR_SIZE + PHDR_SIZE;
+
+    let mut elf = Vec::with_capacity((payload_offset + payload.len() as u64) as usize);
+
+    // -- ELF header --
+    elf.extend_from_slice(&[0x7f, b'E', b'L', b'F']); // e_ident[0..4]: magic
+    elf.push(2); // EI_CLASS = ELFCLASS64
+    elf.push(1); // EI_DATA = ELFDATA2LSB
+    elf.push(1); // EI_VERSION = EV_CURRENT
+    elf.push(0); // EI_OSABI = ELFOSABI_SYSV
+    elf.extend_from_slice(&[0u8; 8]); // EI_ABIVERSION + padding = e_ident[9..16]
+    elf.extend_from_slice(&2u16.to_le_bytes()); // e_type = ET_EXEC
+    elf.extend_from_slice(&0x3eu16.to_le_bytes()); // e_machine = EM_X86_64
+    elf.extend_from_slice(&1u32.to_le_bytes()); // e_version
+    elf.extend_from_slice(&load_addr.to_le_bytes()); // e_entry
+    elf.extend_from_slice(&EHDR_SIZE.to_le_bytes()); // e_phoff
+    elf.extend_from_slice(&0u64.to_le_bytes()); // e_shoff (no section headers)
+    elf.extend_from_slice(&0u32.to_le_bytes()); // e_flags
+    elf.extend_from_slice(&(EHDR_SIZE as u16).to_le_bytes()); // e_ehsize
+    elf.extend_from_slice(&(PHDR_SIZE as u16).to_le_bytes()); // e_phentsize
+    elf.extend_from_slice(&1u16.to_le_bytes()); // e_phnum
+    elf.extend_from_slice(&0u16.to_le_bytes()); // e_shentsize
+    elf.extend_from_slice(&0u16.to_le_bytes()); // e_shnum
+    elf.extend_from_slice(&0u16.to_le_bytes()); // e_shstrndx
+    assert_eq!(elf.len() as u64, EHDR_SIZE);
+
+    // -- program header: one PT_LOAD segment, R+W+X (the payload is both
+    // code and its own read/write scratch buffer, same as the other
+    // demos' single combined page) --
+    elf.extend_from_slice(&1u32.to_le_bytes()); // p_type = PT_LOAD
+    elf.extend_from_slice(&7u32.to_le_bytes()); // p_flags = PF_X|PF_W|PF_R
+    elf.extend_from_slice(&payload_offset.to_le_bytes()); // p_offset
+    elf.extend_from_slice(&load_addr.to_le_bytes()); // p_vaddr
+    elf.extend_from_slice(&load_addr.to_le_bytes()); // p_paddr (unused by our loader)
+    elf.extend_from_slice(&(payload.len() as u64).to_le_bytes()); // p_filesz
+    elf.extend_from_slice(&(payload.len() as u64).to_le_bytes()); // p_memsz
+    elf.extend_from_slice(&4096u64.to_le_bytes()); // p_align
+    assert_eq!(elf.len() as u64, payload_offset);
+
+    elf.extend_from_slice(&payload);
+    elf
+}
+
+/// Builds `build_test_elf`, loads it through the real ELF loader
+/// (src/elf.rs) into its own address space, and — if `run` — spawns a
+/// thread that runs it: the same read/write echo behavior as
+/// `run_isolated_demo`, but arrived at by parsing an actual (if hand-
+/// built) ELF file instead of hand-mapping a page directly. The binary is
+/// always built and loaded regardless of `run` (so the loader is always
+/// really exercised), just not necessarily executed — same reasoning as
+/// `spawn_isolated_demo`'s own `run` parameter.
+pub fn spawn_elf_demo(
+    kernel_mapper: &mut OffsetPageTable<'_>,
+    physical_memory_offset: VirtAddr,
+    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
+    run: bool,
+) {
+    let elf_bytes = build_test_elf(ELF_LOAD_ADDR);
+    let (mut isolated_mapper, loaded) =
+        elf::load(&elf_bytes, physical_memory_offset, frame_allocator);
+
+    crate::println!(
+        "loaded a real ELF binary: entry={:?} stack_top={:?}",
+        loaded.entry,
+        loaded.stack_top
+    );
+    ELF_DEMO_STACK_TOP.store(loaded.stack_top.as_u64(), Ordering::Relaxed);
+
+    if run {
+        scheduler::spawn_isolated(
+            run_elf_demo,
+            loaded.page_table,
+            kernel_mapper,
+            &mut isolated_mapper,
+            frame_allocator,
+        );
+    }
+}
+
+/// Spawned via `spawn_elf_demo`. `ELF_LOAD_ADDR` is `e_entry` by
+/// construction (see `build_test_elf`); the stack's address is read back
+/// from `ELF_DEMO_STACK_TOP` rather than hardcoded, since `elf::load`
+/// decides its placement dynamically.
+pub fn run_elf_demo() -> ! {
+    let entry = VirtAddr::new(ELF_LOAD_ADDR);
+    let stack_top = VirtAddr::new(ELF_DEMO_STACK_TOP.load(Ordering::Relaxed));
 
     unsafe {
         enter_ring3(entry, stack_top);

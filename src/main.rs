@@ -150,6 +150,20 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
         );
     }
 
+    // A real ELF loader (src/elf.rs): the same read/write echo behavior
+    // as the isolated demo above, but parsed from an actual (if hand-
+    // built, see userspace::build_test_elf) ELF64 binary rather than
+    // mapped directly — the binary is always parsed and loaded regardless
+    // of `run`, same reasoning as the isolated demo above. `run: false`
+    // for the same reason too: verified working (echoes typed characters
+    // back through a real parsed-and-mapped ELF binary), but left on
+    // permanently it's the same double-echo-every-keystroke problem.
+    // Flip to `true` to re-verify the loader end to end.
+    #[cfg(not(test))]
+    {
+        velora_os::userspace::spawn_elf_demo(&mut mapper, phys_mem_offset, &mut frame_allocator, false);
+    }
+
     // Commented out while focusing on paging — re-enable to run the test suite.
     #[cfg(test)]
     test_main();
