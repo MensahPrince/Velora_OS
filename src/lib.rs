@@ -32,6 +32,7 @@ pub mod memory;
 pub mod task;
 pub mod scheduler;
 pub mod userspace;
+pub mod syscall;
 use core::panic::PanicInfo;
 
 
