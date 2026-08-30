@@ -88,14 +88,14 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
 
     run_bringup_demo(&mut mapper, &mut frame_allocator);
 
-    // Two demo kernel threads, to show the scheduler actually preempting:
-    // thread A never yields voluntarily, so it only ever gives up the CPU
-    // when the timer interrupts it; thread B yields explicitly every
-    // iteration instead. Not spawned in test builds — they print forever
-    // in the background, which would race with tests that check exact VGA
-    // buffer contents.
+    // Two demo kernel threads that proved the scheduler actually preempts
+    // (thread A relying purely on timer preemption, thread B yielding
+    // explicitly every iteration) — verified working via a real QEMU boot.
+    // Disabled now: left running, they print forever in the background,
+    // which just gets in the way of using the kernel normally. Re-enable
+    // to sanity-check the scheduler again after touching it.
     #[cfg(not(test))]
-    {
+    if false {
         velora_os::scheduler::spawn(demo_thread_a);
         velora_os::scheduler::spawn(demo_thread_b);
     }
