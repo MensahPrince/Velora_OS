@@ -88,6 +88,25 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
 
     run_bringup_demo(&mut mapper, &mut frame_allocator);
 
+    // Real disk I/O (src/ata.rs): read sector 0 back from the same disk
+    // this kernel itself just booted from, and check for the boot
+    // signature BIOS required to be there in order to boot it at all —
+    // proof against an independently-known-correct disk, not just "the
+    // driver agrees with itself".
+    {
+        let mut sector = [0u8; velora_os::ata::SECTOR_SIZE];
+        velora_os::ata::read_sector(0, &mut sector);
+        let has_boot_signature = sector[510] == 0x55 && sector[511] == 0xAA;
+        println!(
+            "ATA: read sector 0 from the boot disk, boot signature {}",
+            if has_boot_signature {
+                "present (0x55AA) — real disk I/O works"
+            } else {
+                "MISSING — something is wrong with the ATA driver"
+            }
+        );
+    }
+
     // Two demo kernel threads that proved the scheduler actually preempts
     // (thread A relying purely on timer preemption, thread B yielding
     // explicitly every iteration) — verified working via a real QEMU boot.

@@ -1,118 +1,131 @@
-# Velora OS 🦀
+# Velora OS
 
-A bare-metal x86_64 operating system kernel written in Rust — built as a study implementation following the **[Writing an OS in Rust](https://os.phil-opp.com/)** blog series by [Philipp Oppermann](https://github.com/phil-opp).
+A bare-metal x86-64 operating system kernel implemented in Rust, developed as an independent systems-programming study. The project originated as an implementation of Philipp Oppermann's *[Writing an OS in Rust](https://os.phil-opp.com/)* series and has since been extended substantially beyond that series' scope to include preemptive multitasking, ring-3 execution with genuine address-space isolation, a register-based system-call interface, an ELF64 loader, and disk I/O.
 
-> **This is a learning project.** The goal is to deeply understand low-level systems programming concepts — memory management, hardware I/O, interrupts, and how an OS is structured — by building one from scratch.
+## Abstract
 
----
+Velora OS is a `no_std`, `no_main` freestanding kernel targeting x86-64 in BIOS long mode. It implements, from first principles, the core subsystems of a conventional monolithic kernel: physical and virtual memory management, interrupt and exception handling, a preemptive round-robin scheduler, cooperative asynchronous task execution, a minimal process model with hardware-enforced memory isolation, a system-call ABI, and a loader for a constrained subset of the ELF64 executable format. Every subsystem is implemented without external kernel frameworks; hardware interfacing (paging structures, the GDT/IDT/TSS, the PIC, and the legacy ATA interface) is programmed directly against the relevant Intel/AMD and device specifications.
 
-## 📖 About
+## Motivation
 
-Velora OS is a `no_std` Rust kernel that runs directly on x86_64 hardware (or QEMU). It does not use Rust's standard library or any underlying OS — it *is* the OS.
+The project exists to develop a rigorous, from-scratch understanding of the mechanisms an operating system kernel depends on: how a CPU transitions between privilege levels, how virtual memory is constructed and isolated between execution contexts, how preemption is implemented at the instruction level, and how these mechanisms compose into something resembling a real kernel. Bugs encountered during development — several of which manifested only under specific timing or address conditions in QEMU — are treated as primary material for that understanding rather than incidental noise; where instructive, their root causes and fixes are documented in the source itself.
 
-This project follows the phil-opp tutorial series chapter by chapter, with additional personal notes baked into the source code as comments to reinforce understanding.
+## System Architecture
 
-**Study Series:** https://os.phil-opp.com/
+### Boot and Memory Management
 
----
+- The kernel is loaded by the [`bootloader`](https://crates.io/crates/bootloader) crate (BIOS boot path), which establishes 64-bit long mode and maps all physical memory at a fixed offset before transferring control to `_start`.
+- Virtual memory is managed through a 4-level paging hierarchy accessed via the `x86_64` crate's `OffsetPageTable` abstraction, addressing physical frames through that bootloader-provided offset.
+- A fixed-size heap (`linked_list_allocator`) backs all dynamic allocation (`alloc::boxed::Box`, `Vec`, `Rc`, and the kernel's own internal data structures).
+- **Isolated address spaces.** `memory::new_address_space` constructs an independent top-level (L4) page table for a process, sharing only the kernel code/data region and the physical-memory offset window with the kernel's own table. No other mapping is inherited, so a process's memory is genuinely unreachable from any other address space, including the kernel's default one — verified directly by querying the kernel's own page tables for a process's memory and confirming no translation exists.
 
-## ✅ Progress
+### Interrupts and Exceptions
 
-| Chapter | Topic | Status |
-|---|---|---|
-| 1 | A Freestanding Rust Binary | ✅ Done |
-| 2 | A Minimal Rust Kernel | ✅ Done |
-| 3 | VGA Text Mode | ✅ Done |
-| 4 | Testing | ✅ Done |
-| 5 | CPU Exceptions & Interrupts (IDT) | ✅ Done |
-| 6+ | Double Faults, Hardware Interrupts, ... | 🔄 In Progress |
+- A hand-populated Interrupt Descriptor Table handles CPU exceptions (breakpoint, double fault, page fault, general protection fault) with diagnostic output — faulting address, error code, and interrupt frame — and all sixteen legacy PIC interrupt lines, preventing an unhandled hardware interrupt from escalating into an unrecoverable triple fault.
+- The Task State Segment provides a dedicated stack for double-fault handling (via the Interrupt Stack Table) and the privilege-transition stack (`RSP0`) used whenever a ring-3-to-ring-0 transition occurs.
 
----
+### Concurrency
 
-## 🏗️ Project Structure
+- **Preemptive scheduling.** A round-robin scheduler switches between kernel threads on every timer interrupt. Context switches are implemented as a hand-written, register-preserving routine (`scheduler::context::switch_to`) that also performs the CR3 (address-space) switch as an atomic part of the same operation — necessary because no intervening memory access is safe between changing the active page table and changing the stack pointer.
+- **Cooperative tasks.** An async/await executor (`task::executor`), driven by `core::task::Waker`, runs as the workload of a single scheduled thread, providing non-blocking I/O multiplexing (e.g. the keyboard input task) without busy-polling.
+- Data structures reachable from interrupt context (the scheduler's ready queue, the keyboard input queue) are deliberately implemented as fixed-capacity, statically allocated ring buffers rather than heap-backed collections: an interrupt can be delivered while an isolated process's address space is active, and such an address space does not map the kernel heap.
+
+### Privilege Isolation and System Calls
+
+- The kernel constructs ring-3 (user-mode) GDT segments and transitions execution to CPL 3 via a manually constructed `IRETQ` frame.
+- A register-based system-call ABI is exposed through a software interrupt (`int 0x80`), serviced by a hand-written entry stub that preserves the full general-purpose register set. This is necessary because the `x86-interrupt` calling convention cannot expose arbitrary registers to handler code: the compiler's generated prologue relocates them before user code runs. Two calls are currently implemented: `write(fd, buf, len)` and `read(fd, buf, len)`.
+
+### Process Loading
+
+- `elf::load` parses the ELF64 file and program-header tables of a static, non-relocatable executable, maps its `PT_LOAD` segments into a freshly constructed isolated address space with permissions derived from `p_flags`, zero-fills the BSS region, and allocates a user-mode stack.
+
+### Storage I/O
+
+- `ata::read_sector` implements polling-mode Programmed I/O against the legacy primary ATA interface (I/O ports `0x1F0`-`0x1F7`), sufficient to read arbitrary LBA28 sectors from the boot disk.
+
+## Project Structure
 
 ```
 velora_os/
 ├── src/
-│   ├── main.rs          # Kernel entry point (_start), panic handlers
-│   ├── lib.rs           # Shared library: test infrastructure, QEMU exit
-│   ├── vga_buffer.rs    # VGA text-mode driver (print! / println! macros)
-│   ├── serial.rs        # UART serial port driver (serial_print! for tests)
-│   └── interrupts.rs    # IDT setup and interrupt handlers (breakpoint, etc.)
-├── tests/
-│   └── basic_boot.rs    # Integration test: kernel boots and prints correctly
-├── x86_64-velora_os.json  # Custom bare-metal target specification
-├── .cargo/
-│   └── config.toml      # Build target, bootimage runner, build-std config
-└── Cargo.toml
+│   ├── main.rs          Kernel entry point, panic handlers, demonstration routines
+│   ├── lib.rs            Library root: test harness, QEMU exit, initialization
+│   ├── gdt.rs             Global Descriptor Table, Task State Segment
+│   ├── interrupts.rs      Interrupt Descriptor Table and exception/IRQ handlers
+│   ├── memory.rs          Paging, frame allocation, isolated address spaces
+│   ├── allocator.rs       Heap initialization
+│   ├── scheduler/         Preemptive round-robin scheduler and context switching
+│   ├── task/              Async executor and cooperative task infrastructure
+│   ├── syscall.rs         System-call entry point and dispatch
+│   ├── userspace.rs       Ring-3 demonstration payloads
+│   ├── elf.rs             ELF64 loader
+│   ├── ata.rs             ATA PIO disk driver
+│   ├── vga_buffer.rs      VGA text-mode output driver
+│   └── serial.rs          UART 16550 serial output driver
+├── tests/                 Integration tests (executed inside QEMU)
+├── x86_64-velora_os.json  Custom bare-metal target specification
+└── .cargo/config.toml     Build configuration (target, build-std, QEMU runner)
 ```
 
----
+## Build and Execution
 
-## 🧰 Key Concepts Covered
+### Toolchain
 
-- **`#![no_std]` / `#![no_main]`** — stripping away the standard library and Rust runtime
-- **Custom linker target** (`x86_64-velora_os.json`) — targeting bare-metal x86_64
-- **VGA Text Buffer** — writing to the screen at `0xb8000` using volatile writes and a global `Mutex`-protected writer
-- **`lazy_static!`** — safely initializing global state in a `no_std` environment
-- **Serial Port (UART 16550)** — outputting text to the host terminal for test output
-- **Custom Test Framework** — running integration tests inside QEMU without `std`
-- **Interrupt Descriptor Table (IDT)** — handling CPU exceptions (breakpoints, etc.) via the `x86-interrupt` ABI
-- **QEMU Debug Exit** — cleanly shutting down QEMU from kernel code using I/O port `0xf4`
-
----
-
-## 🚀 Running
-
-### Prerequisites
-
-- [Rust nightly toolchain](https://www.rust-lang.org/tools/install)
-- [`bootimage`](https://github.com/rust-osdev/bootimage): `cargo install bootimage`
-- [QEMU](https://www.qemu.org/): `sudo apt install qemu-system-x86`
+This kernel targets an unstable subset of the Rust compiler (`build-std`, naked functions, the `x86-interrupt` ABI) and is consequently sensitive to nightly-compiler drift; a specific nightly release is pinned:
 
 ```bash
-# Install the nightly toolchain and required components
-rustup override set nightly
+rustup override set nightly-2026-05-01
 rustup component add rust-src llvm-tools-preview
+cargo install bootimage
 ```
 
-### Build & Run
+`qemu-system-x86_64` must be available on `PATH`.
+
+### Running
 
 ```bash
-# Run in QEMU
-cargo run
-
-# Run tests in QEMU (headless)
-cargo test
+cargo run     # boot the kernel in QEMU
+cargo test    # execute the integration test suite (headless)
 ```
 
----
+## Implementation Status
 
-## ⚙️ How It Works
+| Subsystem | State |
+|---|---|
+| Freestanding boot, VGA/serial output | Implemented |
+| Paging, heap allocation | Implemented |
+| CPU exception handling, hardware interrupts | Implemented |
+| Preemptive scheduling | Implemented |
+| Cooperative async task execution | Implemented |
+| Ring-3 execution | Implemented |
+| Isolated address spaces (per-process paging) | Implemented |
+| System-call interface | Implemented (`read`, `write`) |
+| ELF64 loading | Implemented (static `PT_LOAD` executables only) |
+| Disk I/O | Implemented (PIO sector reads only) |
+| Filesystem | Not implemented |
+| Process lifecycle (spawn/exit) | Not implemented |
 
-```
-Bootloader (BIOS/UEFI)
-    └── bootimage (Rust bootloader crate)
-        └── _start()  ←  first Rust code to execute
-            ├── init()          → loads IDT
-            ├── int3()          → triggers breakpoint exception (handled!)
-            └── loop {}         → kernel idles forever
-```
+## Known Limitations
 
-The kernel boots via the [`bootloader`](https://crates.io/crates/bootloader) crate, which sets up the CPU into 64-bit long mode before handing control to `_start()`.
+- **Single concurrent ring-3 thread.** The privilege-transition stack (`TSS.RSP0`) is a single, statically allocated region shared by every thread; running two ring-3 threads concurrently corrupts this shared state. A per-thread `RSP0`, swapped by the scheduler alongside the CR3 switch, is the identified fix and has not yet been implemented.
+- **ELF loader constraints.** Only statically linked, non-PIE executables with page-aligned `PT_LOAD` segments are supported; there is no relocation processing, dynamic linking, or section-header parsing.
+- **No filesystem.** The ATA driver reads raw sectors only; there is no partition table or filesystem parser, so loading an arbitrary file from disk is not yet possible.
+- **No NX enforcement.** `EFER.NXE` is not enabled, so the page table's `NO_EXECUTE` bit is not currently meaningful.
+- **No process termination.** Threads, once spawned, are not reclaimed; there is no `exit` system call or scheduler-level cleanup path.
 
----
+## Future Work
 
-## 📚 References
+In approximate dependency order: a per-thread privilege-transition stack, removing the single-ring-3-thread constraint; a minimal filesystem sufficient to load an ELF binary from disk rather than an embedded test payload; process lifecycle management (`exit`, and eventually `fork`/`exec`-equivalent primitives); and an expanded system-call surface.
 
-- **Primary tutorial:** https://os.phil-opp.com/
-- [`x86_64` crate](https://crates.io/crates/x86_64) — safe abstractions over x86_64 hardware
-- [`bootloader` crate](https://crates.io/crates/bootloader) — pure-Rust bootloader
-- [`uart_16550` crate](https://crates.io/crates/uart_16550) — UART serial port driver
-- [`lazy_static` crate](https://crates.io/crates/lazy_static) — runtime-initialized statics
+## References
 
----
+- P. Oppermann, *[Writing an OS in Rust](https://os.phil-opp.com/)* — the tutorial series this project originated from; covers freestanding binaries through async/await task execution.
+- *Intel 64 and IA-32 Architectures Software Developer's Manuals* — paging, interrupt/exception handling, segmentation, and privilege-level transitions.
+- [`x86_64` crate](https://crates.io/crates/x86_64) — safe(r) abstractions over the structures above.
+- [`bootloader` crate](https://crates.io/crates/bootloader) — the BIOS bootloader used to enter long mode.
+- *AT Attachment (ATA/ATAPI) specification* — the legacy PIO command interface implemented in `src/ata.rs`.
+- [*Executable and Linkable Format (ELF) specification*](https://refspecs.linuxfoundation.org/elf/elf.pdf) — the binary format implemented, as a subset, in `src/elf.rs`.
 
-## 📝 License
+## License
 
-This project is for educational purposes. Code structure is derived from the [phil-opp/blog_os](https://github.com/phil-opp/blog_os) tutorial series, which is licensed under MIT / Apache 2.0.
+This project is released for educational and research purposes. Portions of its structure derive from the [`phil-opp/blog_os`](https://github.com/phil-opp/blog_os) tutorial series (MIT / Apache 2.0).
