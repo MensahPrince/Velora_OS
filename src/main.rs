@@ -125,12 +125,16 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     // scheduler demo threads above: it prints in the background, which
     // would race with tests that check exact VGA buffer contents.
     //
-    // Disabled for now: this and the isolated demo below both drop a
-    // thread into ring 3, and both ring3<->ring0 transitions go through
-    // the single shared RSP0 stack (see the TSS setup in src/gdt.rs) —
-    // which is only sound with one ring-3 thread at a time. Running both
-    // concurrently is under investigation; re-enable once RSP0 is
-    // per-thread (or some other fix lands) rather than a single static.
+    // This and the other two ring-3 demos below all drop a thread into
+    // ring 3 concurrently. Each ring3<->ring0 transition used to go
+    // through a single shared RSP0 stack (src/gdt.rs), which only worked
+    // with one ring-3 thread at a time; RSP0 is now per-thread
+    // (gdt::set_rsp0, written by scheduler::schedule on every switch), and
+    // all three running at once is verified working (stable across
+    // several keystrokes, each correctly echoed by whichever one happened
+    // to read it). Disabled again now that that's proven — same "prints
+    // forever in the background" reason as the other demos. Flip to
+    // `true` (here and the other two) to re-verify.
     #[cfg(not(test))]
     if false {
         velora_os::userspace::map_demo_page(&mut mapper, phys_mem_offset, &mut frame_allocator);
@@ -146,10 +150,11 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     // spawn_isolated_demo always does that part regardless of `run`.
     //
     // `run: false`: actually executing the demo thread works (verified —
-    // it echoes typed characters back via its own sys_read/sys_write), but
-    // left on permanently every keystroke shows up twice: once from the
-    // kernel's own keyboard task, once from this. Flip to `true` to
-    // re-verify the syscall ABI end to end.
+    // it echoes typed characters back via its own sys_read/sys_write, even
+    // concurrently with the other two ring-3 demos now that RSP0 is
+    // per-thread), but left on permanently every keystroke shows up
+    // twice: once from the kernel's own keyboard task, once from this.
+    // Flip to `true` to re-verify the syscall ABI end to end.
     #[cfg(not(test))]
     {
         use x86_64::structures::paging::Translate;
@@ -175,9 +180,9 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     // mapped directly — the binary is always parsed and loaded regardless
     // of `run`, same reasoning as the isolated demo above. `run: false`
     // for the same reason too: verified working (echoes typed characters
-    // back through a real parsed-and-mapped ELF binary), but left on
-    // permanently it's the same double-echo-every-keystroke problem.
-    // Flip to `true` to re-verify the loader end to end.
+    // back through a real parsed-and-mapped ELF binary, alongside the
+    // other two ring-3 demos), but left on permanently it's the same
+    // double-echo-every-keystroke problem. Flip to `true` to re-verify.
     #[cfg(not(test))]
     {
         velora_os::userspace::spawn_elf_demo(&mut mapper, phys_mem_offset, &mut frame_allocator, false);

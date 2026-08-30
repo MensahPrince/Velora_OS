@@ -18,6 +18,7 @@
 
 mod context;
 
+use crate::gdt;
 use alloc::alloc::Layout;
 use spin::Mutex;
 use x86_64::{
@@ -68,6 +69,18 @@ struct Thread {
     /// runs. `None` means "the shared kernel address space every ordinary
     /// thread uses" (`SchedulerState::kernel_page_table`).
     page_table: Option<PhysFrame>,
+    /// The fixed top of this thread's own kernel-mode stack — unlike
+    /// `stack_pointer`, this never changes once the thread is spawned.
+    /// `schedule()` writes it into the TSS's RSP0 field
+    /// (`gdt::set_rsp0`) on every switch, for every thread, not just
+    /// ring-3-capable ones: harmless for a thread that never enters ring 3
+    /// (RSP0 just goes unused for it), but means each thread that *does*
+    /// gets its own privilege-transition stack instead of every ring-3
+    /// thread sharing one — see the module docs on `gdt::set_rsp0` for why
+    /// that sharing was a real bug. `0` for the boot thread (id 0), which
+    /// has no kernel-allocated stack of its own and is never expected to
+    /// enter ring 3.
+    kernel_stack_top: u64,
 }
 
 /// A fixed-capacity FIFO of thread ids — deliberately not a heap-backed
@@ -147,6 +160,7 @@ pub fn init() {
                 stack_size: 0,
                 entry: None,
                 page_table: None,
+                kernel_stack_top: 0,
             })
         } else {
             None
@@ -213,6 +227,7 @@ pub fn spawn(entry: fn() -> !) {
             stack_size: STACK_SIZE,
             entry: Some(entry),
             page_table: None,
+            kernel_stack_top: stack_base as u64 + STACK_SIZE as u64,
         });
         state.ready_queue.push_back(id);
     });
@@ -290,6 +305,7 @@ pub fn spawn_isolated(
             stack_size: STACK_SIZE,
             entry: Some(entry),
             page_table: Some(page_table),
+            kernel_stack_top: stack_base as u64 + STACK_SIZE as u64,
         });
         state.ready_queue.push_back(id);
     });
@@ -431,6 +447,15 @@ fn schedule() {
         .unwrap_or(state.kernel_page_table)
         .start_address()
         .as_u64();
+    let new_rsp0 = next_thread.kernel_stack_top;
+
+    // Unlike the CR3 write (handled inside switch_to itself — see its doc
+    // comment for why), updating RSP0 doesn't change what's currently
+    // accessible, so there's no ordering hazard in doing it here, as
+    // plain Rust, before the actual switch.
+    unsafe {
+        gdt::set_rsp0(VirtAddr::new(new_rsp0));
+    }
 
     // Unlock before the switch: holding a spin::Mutex guard across
     // switch_to would deadlock the first time anything tried to lock

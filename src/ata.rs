@@ -33,7 +33,19 @@ const STATUS_BSY: u8 = 1 << 7;
 /// that never becomes ready. Not a real timeout (this driver has no clock
 /// to measure against) — just an upper bound on how long a broken wait can
 /// spin before turning into a clear panic instead of hanging forever.
-const POLL_ATTEMPTS: u32 = 100_000;
+///
+/// The original value here (100_000) turned out to be a lot more marginal
+/// than it looked: it broke when unrelated scheduler changes elsewhere in
+/// the kernel shifted the compiled binary's timing enough to tip a
+/// previously-comfortable margin into an occasional failure — without
+/// changing anything about the ATA driver itself or the order it runs in.
+/// A hardcoded iteration count is fundamentally a proxy for wall-clock
+/// time, not a real one, and 100_000 iterations apparently wasn't enough
+/// slack against that kind of incidental drift. This is generously larger
+/// specifically so it stops being sensitive to that: even at this size, a
+/// modern CPU (or QEMU's emulation of one) burns through it in a small
+/// fraction of a second, so a genuinely broken drive still fails fast.
+const POLL_ATTEMPTS: u32 = 10_000_000;
 
 pub const SECTOR_SIZE: usize = 512;
 
