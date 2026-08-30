@@ -33,6 +33,7 @@ pub mod task;
 pub mod scheduler;
 pub mod userspace;
 pub mod syscall;
+pub mod elf;
 use core::panic::PanicInfo;
 
 
