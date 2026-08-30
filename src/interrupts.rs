@@ -192,10 +192,36 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(
     _stack_frame: InterruptStackFrame)
 {
     use x86_64::instructions::port::Port;
+    use x86_64::registers::control::Cr3;
+
+    // add_scancode() (and the task wakeup it can trigger) touches
+    // heap-backed queues — but this handler can run with *any* thread's
+    // address space active, since a hardware interrupt doesn't care what
+    // it interrupted. If that happens to be a thread with its own
+    // (isolated) address space, the heap isn't mapped there at all, and
+    // touching it faults. Force the kernel's own table for the duration
+    // of the heap-touching part, then put back whatever was active before
+    // this handler ran — its "resume" (an iretq, possibly straight back
+    // into ring 3) needs its own address space, not the kernel's. Plain
+    // Cr3::write is fine here (not the atomic asm dance
+    // scheduler::context::switch_to needs): RSP never changes in this
+    // function, and wherever it currently points — RSP0, or a
+    // spawn_isolated thread's own dual-mapped kernel stack — is reachable
+    // under both the interrupted address space and the kernel's, by
+    // design (see spawn_isolated).
+    let (interrupted_page_table, page_table_flags) = Cr3::read();
+    let kernel_page_table = crate::scheduler::kernel_page_table();
+    if interrupted_page_table != kernel_page_table {
+        unsafe { Cr3::write(kernel_page_table, page_table_flags) };
+    }
 
     let mut port = Port::new(0x60);
     let scancode: u8 = unsafe { port.read() };
     crate::task::keyboard::add_scancode(scancode);
+
+    if interrupted_page_table != kernel_page_table {
+        unsafe { Cr3::write(interrupted_page_table, page_table_flags) };
+    }
 
     unsafe {
         PICS.lock()

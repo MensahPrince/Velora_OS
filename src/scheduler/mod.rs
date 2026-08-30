@@ -164,6 +164,23 @@ pub fn init() {
     });
 }
 
+/// The shared kernel address space's L4 frame — the one every ordinary
+/// (non-isolated) thread runs under. Interrupt handlers that touch
+/// heap-backed state (e.g. the keyboard handler, src/interrupts.rs) need
+/// this: such a handler can run with *any* thread's address space active,
+/// since interrupts don't care what was interrupted, so it has to force
+/// its way back to an address space where the heap is actually mapped
+/// before touching anything heap-backed.
+pub fn kernel_page_table() -> PhysFrame {
+    interrupts::without_interrupts(|| {
+        SCHEDULER
+            .lock()
+            .as_ref()
+            .expect("scheduler not initialized")
+            .kernel_page_table
+    })
+}
+
 /// Spawn a new kernel thread running `entry` (which must never return —
 /// there's no thread-exit support yet, see the module docs on `Thread`).
 /// It joins the round-robin rotation immediately.
