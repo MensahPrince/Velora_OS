@@ -16,9 +16,10 @@ use core::task::{Context, Poll, Waker};
 use crossbeam_queue::ArrayQueue;
 
 /// Maximum number of tasks that can be simultaneously queued as "ready to
-/// poll". Sized generously relative to how many tasks this kernel spawns;
-/// if it's ever exceeded, `wake_task`/`spawn` panic rather than silently
-/// dropping a wakeup.
+/// poll". Sized generously relative to how many tasks this kernel spawns.
+/// A single task can land in the queue more than once (e.g. two wakeups
+/// before it's next polled), so this is headroom against bursts, not a cap
+/// on the number of distinct tasks.
 const MAX_QUEUED_TASKS: usize = 128;
 
 struct TaskWaker {
@@ -34,10 +35,20 @@ impl TaskWaker {
         }))
     }
 
+    /// Wakeups can arrive from interrupt context (e.g. a keystroke, via
+    /// `add_scancode` -> `AtomicWaker::wake` -> here), and a burst of them
+    /// for a task that isn't being polled fast enough could in principle
+    /// fill the ready queue. Dropping the extra wakeup and logging is the
+    /// right failure mode: the task will still run once whatever's already
+    /// queued for it is processed, whereas panicking here would let an
+    /// interrupt storm crash the kernel outright.
     fn wake_task(&self) {
-        self.task_queue
-            .push(self.task_id)
-            .expect("task_queue full");
+        if self.task_queue.push(self.task_id).is_err() {
+            crate::println!(
+                "WARNING: executor ready queue full; dropping a wakeup for task {:?}",
+                self.task_id
+            );
+        }
     }
 }
 

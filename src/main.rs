@@ -35,17 +35,15 @@ use velora_os::println;
 extern crate alloc;
 use alloc::{boxed::Box, vec, vec::Vec, rc::Rc};
 
+use velora_os::memory::BootInfoFrameAllocator;
+use x86_64::structures::paging::{FrameAllocator, OffsetPageTable, Page, Size4KiB};
+
 entry_point!(kernel_main);
 fn kernel_main(boot_info: &'static BootInfo) -> ! {
     // `memory` module — now exposes `memory::init()` which returns an
     // OffsetPageTable. Importing the whole module keeps call-sites readable.
     use velora_os::memory;
-    // `Translate` is the trait that gives OffsetPageTable its
-    // `translate_addr` method. It must be in scope for the method to resolve.
-    use x86_64::structures::paging::Page;
     use x86_64::{VirtAddr/*, structures::paging::Translate*/ };
-    // use x86_64::structures::paging::Size4KiB;
-    use velora_os::memory::BootInfoFrameAllocator;
     use velora_os::allocator; // import the new allocator module
 
     // -> ! means this function never returns.
@@ -85,6 +83,40 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     velora_os::task::keyboard::init_queue();
     velora_os::enable_interrupts();
 
+    run_bringup_demo(&mut mapper, &mut frame_allocator);
+
+    // Commented out while focusing on paging — re-enable to run the test suite.
+    #[cfg(test)]
+    test_main();
+
+    // A message to prove that the OS is running
+    println!("Velora_OS did not crash");
+
+    // Hand off to the cooperative-multitasking executor. It never returns:
+    // it polls ready tasks and `hlt`s the CPU whenever there's nothing to
+    // do, waking back up on the next interrupt (e.g. a keystroke).
+    use velora_os::task::{Task, executor::Executor, keyboard::print_keypresses};
+    let mut executor = Executor::new();
+    executor.spawn(Task::new(print_keypresses()));
+    executor.run();
+}
+
+// ------------------------------------------------------------------
+// ONE-TIME BOOT DEMO
+// ------------------------------------------------------------------
+
+/// Exercises paging (a manual page mapping), the heap allocator (Box, Vec),
+/// and Rc reference counting, once, at boot. Not part of the kernel's
+/// ongoing behavior — kept out of `kernel_main` so its startup sequence
+/// stays readable as more real subsystems (a scheduler, more tasks) land
+/// there.
+fn run_bringup_demo(
+    mapper: &mut OffsetPageTable<'_>,
+    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
+) {
+    use velora_os::memory;
+    use x86_64::VirtAddr;
+
     // Map an unused page to the VGA text buffer frame, purely as a demo of
     // `mapper.map_to`. Deliberately NOT the null page (address 0) — mapping
     // page 0 would remove the usual guarantee that a null-pointer write
@@ -92,48 +124,21 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     let page = Page::containing_address(VirtAddr::new(0xdeadbeaf000));
 
     // call create_example_mapping to create a mapping for the page
-    memory::create_example_mapping(page, &mut mapper, &mut frame_allocator);
+    memory::create_example_mapping(page, mapper, frame_allocator);
 
     // write the string `New!` to the screen through the new mapping
     let page_ptr: *mut u64 = page.start_address().as_mut_ptr();
     unsafe { page_ptr.offset(400).write_volatile(0x_f021_f077_f065_f04e) };
 
-    //The commented code below this comment was for simulating
-    // a page fault.
-    // We used an unsafe to write to an invalid memory location address 0xdeadbeef
-    // The virtual address is not mapped to any physical addr in the page tables.
-    // This will cause a page fault.
-    // As observed, when the kernel is started, it enters an endless
-    // bootloop. The reason for the bootloop is as follows.
-    // 1. The CPU tries to write to 0xdeadbeef which causes a page fault.
-    // 2. The CPU looks at the corresponding entru in in the IDT and sees that
-    //    there is no handler and a double fault occurs.
-    // 3. The CPU loos at the IDT entry of the double fault handler,
-    //    but this entry does not specify a handler function either. Thus, a triple fault occurs.
-    // 4. A triple fault is fatal. QEMU reacts to it like most real hardware
-    //    by resetting the system. This causes the endless bootloop.
-    //
-    // The code below is for simulating a page fault.
-    //
-    //unsafe {
-    //    *(0xdeadbeef as *mut u8) = 42;
-    //};
+    // A write to an unmapped address (e.g. 0xdeadbeef) triggers a page
+    // fault; with no handler for it, that becomes a double fault, and with
+    // no handler for THAT either, a fatal triple fault — QEMU (like most
+    // real hardware) reacts to a triple fault by resetting, which is why
+    // that used to show up as an endless bootloop. src/interrupts.rs now
+    // has real page-fault and double-fault handlers, so this no longer
+    // happens; kept here as a note since it's a rite of passage in OS dev.
 
-    // The code at the end of this comment is for simulating
-    // a stack overflow.
-    // fn stack_overflow() {
-    //    stack_overflow();
-    //}
-
-    // Trigger a stackoverflow
-    //stack_overflow();
-
-    // Commented out while focusing on paging — re-enable to test the IDT
-    // breakpoint exception handler.
-    // x86_64::instructions::interrupts::int3();
-
-
-    //allocate a number on the heap and print it 
+    //allocate a number on the heap and print it
     let heap_value = Box::new(41);
     println!("Heap_value at {:p}", heap_value);
 
@@ -151,21 +156,6 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     println!("current reference count is {}", Rc::strong_count(&cloned_reference));
     core::mem::drop(reference_counted);
     println!("reference count is {} now", Rc::strong_count(&cloned_reference));
-    
-    // Commented out while focusing on paging — re-enable to run the test suite.
-    #[cfg(test)]
-    test_main();
-
-    // A message to prove that the OS is running
-    println!("Velora_OS did not crash");
-
-    // Hand off to the cooperative-multitasking executor. It never returns:
-    // it polls ready tasks and `hlt`s the CPU whenever there's nothing to
-    // do, waking back up on the next interrupt (e.g. a keystroke).
-    use velora_os::task::{Task, executor::Executor, keyboard::print_keypresses};
-    let mut executor = Executor::new();
-    executor.spawn(Task::new(print_keypresses()));
-    executor.run();
 }
 
 // ------------------------------------------------------------------
