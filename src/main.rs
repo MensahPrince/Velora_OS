@@ -147,10 +147,16 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     #[cfg(test)]
     test_main();
 
-    // Loop forever — the kernel must never stop running
     // A message to prove that the OS is running
     println!("Velora_OS did not crash");
-    velora_os::hlt_loop();
+
+    // Hand off to the cooperative-multitasking executor. It never returns:
+    // it polls ready tasks and `hlt`s the CPU whenever there's nothing to
+    // do, waking back up on the next interrupt (e.g. a keystroke).
+    use velora_os::task::{Task, executor::Executor, keyboard::print_keypresses};
+    let mut executor = Executor::new();
+    executor.spawn(Task::new(print_keypresses()));
+    executor.run();
 }
 
 // ------------------------------------------------------------------

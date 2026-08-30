@@ -113,8 +113,6 @@ unhandled_pic_interrupt!(irq13_handler, PIC_2_OFFSET + 5);
 unhandled_pic_interrupt!(irq14_handler, PIC_2_OFFSET + 6);
 unhandled_pic_interrupt!(irq15_handler, PIC_2_OFFSET + 7);
 
-use crate::print;
-
 extern "x86-interrupt" fn timer_interrupt_handler(
     _stack_frame: InterruptStackFrame)
 {
@@ -126,32 +124,18 @@ extern "x86-interrupt" fn timer_interrupt_handler(
 
 // in/src/interrupts.rs
 
+// Scancode decoding and printing used to happen right here, in interrupt
+// context. It now happens in the `print_keypresses` async task
+// (src/task/keyboard.rs); this handler just reads the raw scancode and
+// hands it off, so keystrokes can't block or slow down other interrupts.
 extern "x86-interrupt" fn keyboard_interrupt_handler(
     _stack_frame: InterruptStackFrame)
 {
-    use pc_keyboard::{layouts, DecodedKey, HandleControl, Keyboard, ScancodeSet1};
-    use spin::Mutex;
     use x86_64::instructions::port::Port;
 
-    lazy_static! {
-        static ref KEYBOARD: Mutex<Keyboard<layouts::Us104Key, ScancodeSet1>> =
-            Mutex::new(Keyboard::new(ScancodeSet1::new(),
-                layouts::Us104Key, HandleControl::Ignore)
-            );
-    }
-
-    let mut keyboard = KEYBOARD.lock();
     let mut port = Port::new(0x60);
-
     let scancode: u8 = unsafe { port.read() };
-    if let Ok(Some(key_event)) = keyboard.add_byte(scancode) {
-        if let Some(key) = keyboard.process_keyevent(key_event) {
-            match key {
-                DecodedKey::Unicode(character) => print!("{}", character),
-                DecodedKey::RawKey(key) => print!("{:?}", key),
-            }
-        }
-    }
+    crate::task::keyboard::add_scancode(scancode);
 
     unsafe {
         PICS.lock()
