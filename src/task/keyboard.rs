@@ -18,6 +18,8 @@ use core::{
     task::{Context, Poll},
 };
 use crossbeam_queue::ArrayQueue;
+use spin::Mutex;
+use x86_64::instructions::interrupts;
 use futures_util::{
     stream::{Stream, StreamExt},
     task::AtomicWaker,
@@ -30,6 +32,68 @@ use pc_keyboard::{DecodedKey, HandleControl, Keyboard, ScancodeSet1, layouts};
 /// than blocking the interrupt handler.
 static SCANCODE_QUEUE: OnceCell<ArrayQueue<u8>> = OnceCell::uninit();
 static WAKER: AtomicWaker = AtomicWaker::new();
+
+/// Decoded keyboard bytes, for `syscall::sys_read` — separate from
+/// `SCANCODE_QUEUE` (which holds *raw* scancodes for `print_keypresses` to
+/// decode) since a syscall wants actual characters, not scancodes.
+///
+/// A small fixed-capacity ring buffer, not a heap-backed queue: unlike
+/// `SCANCODE_QUEUE` (only ever touched by the keyboard ISR and
+/// `print_keypresses`, both always under the kernel's own CR3),
+/// `sys_read` reaches this from inside a syscall, which the calling
+/// process itself triggers — deliberately forcing kernel CR3 first for
+/// exactly this reason (see its doc comment), but keeping this heap-free
+/// too means that safety doesn't depend on every future caller
+/// remembering to do that.
+const INPUT_QUEUE_CAPACITY: usize = 128;
+
+struct InputQueue {
+    bytes: [u8; INPUT_QUEUE_CAPACITY],
+    head: usize,
+    len: usize,
+}
+
+impl InputQueue {
+    const fn new() -> Self {
+        InputQueue {
+            bytes: [0; INPUT_QUEUE_CAPACITY],
+            head: 0,
+            len: 0,
+        }
+    }
+
+    fn push(&mut self, byte: u8) {
+        if self.len == INPUT_QUEUE_CAPACITY {
+            return; // full: drop the byte rather than overwrite unread ones
+        }
+        let index = (self.head + self.len) % INPUT_QUEUE_CAPACITY;
+        self.bytes[index] = byte;
+        self.len += 1;
+    }
+
+    fn pop(&mut self) -> Option<u8> {
+        if self.len == 0 {
+            return None;
+        }
+        let byte = self.bytes[self.head];
+        self.head = (self.head + 1) % INPUT_QUEUE_CAPACITY;
+        self.len -= 1;
+        Some(byte)
+    }
+}
+
+static INPUT_QUEUE: Mutex<InputQueue> = Mutex::new(InputQueue::new());
+
+/// Push one decoded byte, from `print_keypresses`.
+fn push_input_byte(byte: u8) {
+    interrupts::without_interrupts(|| INPUT_QUEUE.lock().push(byte));
+}
+
+/// Pop one decoded byte for `syscall::sys_read`. Never blocks: `None`
+/// means nothing's available right now, not an error.
+pub fn try_pop_input_byte() -> Option<u8> {
+    interrupts::without_interrupts(|| INPUT_QUEUE.lock().pop())
+}
 
 /// Called by the keyboard interrupt handler with the raw scancode byte read
 /// from port 0x60. Must never block, allocate on the heap, or panic — it
@@ -104,7 +168,18 @@ pub async fn print_keypresses() {
         if let Ok(Some(key_event)) = keyboard.add_byte(scancode) {
             if let Some(key) = keyboard.process_keyevent(key_event) {
                 match key {
-                    DecodedKey::Unicode(character) => print!("{}", character),
+                    DecodedKey::Unicode(character) => {
+                        print!("{}", character);
+                        // Also feed syscall::sys_read, for anything that
+                        // wants real keyboard input rather than just the
+                        // screen echo above (see src/userspace.rs's echo
+                        // demo). Only ASCII fits in the single-byte queue;
+                        // silently dropping anything else is an accepted
+                        // limitation of this first pass, not a bug.
+                        if character.is_ascii() {
+                            push_input_byte(character as u8);
+                        }
+                    }
                     DecodedKey::RawKey(key) => print!("{:?}", key),
                 }
             }
