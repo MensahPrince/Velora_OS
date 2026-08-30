@@ -34,6 +34,7 @@ pub mod scheduler;
 pub mod userspace;
 pub mod syscall;
 pub mod elf;
+pub mod ata;
 use core::panic::PanicInfo;
 
 
