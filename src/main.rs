@@ -76,10 +76,11 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     // This exercises the new mapper and confirms the paging setup is correct.
 
     allocator::init_heap(&mut mapper, &mut frame_allocator).expect("init_heap failed");
-    // map an unused page
-    let page = Page::containing_address(VirtAddr::new(0));
-    // Create a mapping for the virtual address 0xdeadbeef000
-    // let page = Page::containing_address(VirtAddr::new(0xdeadbeaf000));
+    // Map an unused page to the VGA text buffer frame, purely as a demo of
+    // `mapper.map_to`. Deliberately NOT the null page (address 0) — mapping
+    // page 0 would remove the usual guarantee that a null-pointer write
+    // faults instead of silently succeeding.
+    let page = Page::containing_address(VirtAddr::new(0xdeadbeaf000));
 
     // call create_example_mapping to create a mapping for the page
     memory::create_example_mapping(page, &mut mapper, &mut frame_allocator);
@@ -87,27 +88,6 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     // write the string `New!` to the screen through the new mapping
     let page_ptr: *mut u64 = page.start_address().as_mut_ptr();
     unsafe { page_ptr.offset(400).write_volatile(0x_f021_f077_f065_f04e) };
-
-    /*
-    let addresses = [
-        // identity-mapped VGA text buffer
-        0xb8000,
-        // a kernel code page
-        0x201008,
-        // a kernel stack page
-        0x0100_0020_1a10,
-        // the start of the physical-memory mapping (should resolve to phys 0)
-        boot_info.physical_memory_offset,
-    ];
-
-    for &address in &addresses {
-        let virt = VirtAddr::new(address);
-        // `translate_addr` walks the page tables via the OffsetPageTable
-        // abstraction. Returns Some(PhysAddr) if mapped, None if not.
-        let phys = mapper.translate_addr(virt);
-        println!("{:?} -> {:?}", virt, phys);
-    }
-    */
 
     //The commented code below this comment was for simulating
     // a page fault.
@@ -184,6 +164,9 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     println!("{}", info);
+    // Disable interrupts so the timer/keyboard handlers can't keep printing
+    // and scroll the panic message off screen while we're halted.
+    x86_64::instructions::interrupts::disable();
     velora_os::hlt_loop();
 }
 

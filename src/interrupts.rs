@@ -18,6 +18,26 @@ lazy_static! {
         idt[InterruptIndex::Timer.as_usize()].set_handler_fn(timer_interrupt_handler);
         idt[InterruptIndex::Keyboard.as_usize()].set_handler_fn(keyboard_interrupt_handler);
 
+        // Every other PIC line (spurious IRQ7/IRQ15, RTC, a second serial
+        // port, ...) is left unmasked by PICS.initialize(). Without a
+        // handler here, one of those firing would hit an empty IDT slot and
+        // triple-fault the kernel. Give them all a minimal handler that just
+        // acknowledges the interrupt.
+        idt[(PIC_1_OFFSET + 2) as usize].set_handler_fn(irq2_handler);
+        idt[(PIC_1_OFFSET + 3) as usize].set_handler_fn(irq3_handler);
+        idt[(PIC_1_OFFSET + 4) as usize].set_handler_fn(irq4_handler);
+        idt[(PIC_1_OFFSET + 5) as usize].set_handler_fn(irq5_handler);
+        idt[(PIC_1_OFFSET + 6) as usize].set_handler_fn(irq6_handler);
+        idt[(PIC_1_OFFSET + 7) as usize].set_handler_fn(irq7_handler);
+        idt[PIC_2_OFFSET as usize].set_handler_fn(irq8_handler);
+        idt[(PIC_2_OFFSET + 1) as usize].set_handler_fn(irq9_handler);
+        idt[(PIC_2_OFFSET + 2) as usize].set_handler_fn(irq10_handler);
+        idt[(PIC_2_OFFSET + 3) as usize].set_handler_fn(irq11_handler);
+        idt[(PIC_2_OFFSET + 4) as usize].set_handler_fn(irq12_handler);
+        idt[(PIC_2_OFFSET + 5) as usize].set_handler_fn(irq13_handler);
+        idt[(PIC_2_OFFSET + 6) as usize].set_handler_fn(irq14_handler);
+        idt[(PIC_2_OFFSET + 7) as usize].set_handler_fn(irq15_handler);
+
         idt
     };
 }
@@ -67,6 +87,31 @@ impl InterruptIndex {
         usize::from(self.as_u8())
     }
 }
+
+macro_rules! unhandled_pic_interrupt {
+    ($name:ident, $vector:expr) => {
+        extern "x86-interrupt" fn $name(_stack_frame: InterruptStackFrame) {
+            unsafe {
+                PICS.lock().notify_end_of_interrupt($vector);
+            }
+        }
+    };
+}
+
+unhandled_pic_interrupt!(irq2_handler, PIC_1_OFFSET + 2);
+unhandled_pic_interrupt!(irq3_handler, PIC_1_OFFSET + 3);
+unhandled_pic_interrupt!(irq4_handler, PIC_1_OFFSET + 4);
+unhandled_pic_interrupt!(irq5_handler, PIC_1_OFFSET + 5);
+unhandled_pic_interrupt!(irq6_handler, PIC_1_OFFSET + 6);
+unhandled_pic_interrupt!(irq7_handler, PIC_1_OFFSET + 7);
+unhandled_pic_interrupt!(irq8_handler, PIC_2_OFFSET);
+unhandled_pic_interrupt!(irq9_handler, PIC_2_OFFSET + 1);
+unhandled_pic_interrupt!(irq10_handler, PIC_2_OFFSET + 2);
+unhandled_pic_interrupt!(irq11_handler, PIC_2_OFFSET + 3);
+unhandled_pic_interrupt!(irq12_handler, PIC_2_OFFSET + 4);
+unhandled_pic_interrupt!(irq13_handler, PIC_2_OFFSET + 5);
+unhandled_pic_interrupt!(irq14_handler, PIC_2_OFFSET + 6);
+unhandled_pic_interrupt!(irq15_handler, PIC_2_OFFSET + 7);
 
 use crate::print;
 

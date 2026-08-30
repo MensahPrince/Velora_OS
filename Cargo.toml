@@ -4,9 +4,6 @@ version = "0.1.0"
 edition = "2024"
 authors = ["MensahPrince <codemesh4@mail.com>"]
 
-[unstable]
-panic-abort-tests = true 
-
 [[bin]]
 name = "velora_os"
 test = true

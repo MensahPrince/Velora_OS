@@ -175,15 +175,18 @@ impl Writer {
         }
     }
 
-    // write_string — write a whole string by writing one byte at a time
+    // write_string — write a whole string one character at a time.
+    // Iterating by `char` (not `byte`) matters for non-ASCII text: a
+    // multi-byte UTF-8 codepoint is one logical character and should turn
+    // into a single ■ placeholder, not one placeholder per encoded byte.
     pub fn write_string(&mut self, s: &str) {
-        for byte in s.bytes() {
-            match byte {
+        for c in s.chars() {
+            match c {
                 // Only write printable ASCII characters (space=0x20 to tilde=0x7e) and newlines.
                 // VGA hardware only understands ASCII + code page 437.
-                0x20..=0x7e | b'\n' => self.write_byte(byte),
+                ' '..='~' | '\n' => self.write_byte(c as u8),
 
-                // For anything outside that range (like UTF-8 multi-byte chars),
+                // For anything outside that range (like non-ASCII characters),
                 // print ■ (0xfe) as a placeholder — VGA can't display them.
                 _ => self.write_byte(0xfe),
             }
