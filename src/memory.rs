@@ -205,3 +205,65 @@ unsafe impl<I: Iterator<Item = PhysFrame>> FrameAllocator<Size4KiB> for BootInfo
         self.frames.next()
     }
 }
+
+// ------------------------------------------------------------------
+// Separate address spaces (real process isolation)
+// ------------------------------------------------------------------
+
+/// Build a fresh, mostly-empty top-level (L4) page table for an isolated
+/// address space, and return both the physical frame holding it (to load
+/// into CR3 later, when actually running something under it) and an
+/// `OffsetPageTable` that can map pages into it *right now*, without ever
+/// switching CR3.
+///
+/// That last part works because every address space this kernel creates
+/// shares the exact same `physical_memory_offset` window over physical
+/// RAM — so a frame belonging to the *new* table can still be reached
+/// through the alias that's already active under the *current* one.
+///
+/// Two entries are copied in from the currently active L4 table before
+/// anything else touches the new one: the one covering low memory (where
+/// the kernel image itself, and identity-mapped regions like the VGA
+/// buffer, live) and the one covering the physical-memory-offset window
+/// itself (`OffsetPageTable` needs that mapping present in whichever table
+/// is active in order to walk into it at all). Everything else — the
+/// heap, every existing demo mapping — is deliberately left out: that's
+/// what makes this a genuinely separate address space rather than just a
+/// relabeled view of the same one. A process built on top of this can
+/// only see what's explicitly mapped into it afterward.
+///
+/// # Safety
+/// `physical_memory_offset` must be the same value passed to `memory::init`
+/// (i.e. the whole of physical memory must really be mapped there), and
+/// must currently be active (this reads the *active* L4 table via CR3).
+pub unsafe fn new_address_space(
+    physical_memory_offset: VirtAddr,
+    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
+) -> (PhysFrame, OffsetPageTable<'static>) {
+    let new_l4_frame = frame_allocator
+        .allocate_frame()
+        .expect("no physical frames left for a new address space's L4 table");
+
+    let new_l4_virt = physical_memory_offset + new_l4_frame.start_address().as_u64();
+    let new_l4_ptr: *mut PageTable = new_l4_virt.as_mut_ptr();
+
+    let new_l4_table: &'static mut PageTable = unsafe {
+        new_l4_ptr.write(PageTable::new());
+        &mut *new_l4_ptr
+    };
+
+    let active_l4_table = unsafe { active_level_4_table(physical_memory_offset) };
+
+    // Index 0: low memory / the kernel image itself.
+    new_l4_table[0] = active_l4_table[0].clone();
+    // Whichever single entry covers physical_memory_offset. One L4 entry
+    // spans 512 GiB, far more RAM than this kernel is ever run with, so
+    // the offset window fitting inside just one entry is a safe
+    // assumption here (rather than something to compute precisely from
+    // the actual installed RAM).
+    let offset_p4_index = usize::from(physical_memory_offset.p4_index());
+    new_l4_table[offset_p4_index] = active_l4_table[offset_p4_index].clone();
+
+    let mapper = unsafe { OffsetPageTable::new(new_l4_table, physical_memory_offset) };
+    (new_l4_frame, mapper)
+}
