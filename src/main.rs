@@ -95,7 +95,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     // driver agrees with itself".
     {
         let mut sector = [0u8; velora_os::ata::SECTOR_SIZE];
-        velora_os::ata::read_sector(0, &mut sector);
+        velora_os::ata::read_sector(velora_os::ata::Drive::Primary, 0, &mut sector);
         let has_boot_signature = sector[510] == 0x55 && sector[511] == 0xAA;
         println!(
             "ATA: read sector 0 from the boot disk, boot signature {}",
@@ -186,6 +186,36 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     #[cfg(not(test))]
     {
         velora_os::userspace::spawn_elf_demo(&mut mapper, phys_mem_offset, &mut frame_allocator, false);
+    }
+
+    // A real filesystem (src/fs.rs): the same ELF-loading behavior as the
+    // demo above, but for a binary read off an actual FAT16 disk
+    // (`fs.img`, built by build.rs from disk/echo.s) through a real
+    // directory/cluster-chain walk, rather than one this kernel built or
+    // embedded itself. `fs::read_file` returns `None` gracefully — not a
+    // panic — if the secondary drive has no recognizable filesystem on it
+    // (e.g. `mkfs.fat`/`mtools` weren't installed when `build.rs` ran), so
+    // this is safe to always attempt. `run: false` for the same
+    // "prints forever in the background" reason as every other ring-3
+    // demo above; flip to `true` to re-verify the full disk-to-ring-3 path
+    // end to end.
+    #[cfg(not(test))]
+    {
+        match velora_os::fs::read_file("ECHO.ELF") {
+            Some(elf_bytes) => {
+                println!("fs: read ECHO.ELF ({} bytes) off the FAT16 disk", elf_bytes.len());
+                velora_os::userspace::spawn_disk_elf_demo(
+                    &elf_bytes,
+                    &mut mapper,
+                    phys_mem_offset,
+                    &mut frame_allocator,
+                    false,
+                );
+            }
+            None => println!(
+                "fs: ECHO.ELF not found on the FAT16 disk (was fs.img built? see build.rs)"
+            ),
+        }
     }
 
     // Commented out while focusing on paging — re-enable to run the test suite.

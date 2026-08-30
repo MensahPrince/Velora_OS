@@ -1,16 +1,18 @@
 // ============================================================
 // ata.rs
 // A minimal ATA PIO (Programmed I/O) driver: enough to read sectors off
-// the primary IDE bus's master drive, by polling. No interrupts, no
+// either drive on the primary IDE bus, by polling. No interrupts, no
 // writes, no drive identification — the standard legacy ATA I/O ports
 // (0x1F0-0x1F7) work unchanged from 1990s hardware through today's
 // chipsets running in IDE-compatibility mode, and QEMU emulates them for
-// its default `-drive` disk without any extra configuration. That default
-// disk is the very same one this kernel itself boots from, which is what
-// makes this driver's own first real test — reading sector 0 back and
-// checking for the boot signature BIOS itself required to be there —
-// a check against a real, independently-verifiable disk rather than
-// something this driver invented for itself to pass.
+// its `-drive` disks without any extra configuration. The master drive is
+// the very same one this kernel itself boots from, which is what makes
+// this driver's own first real test — reading sector 0 back and checking
+// for the boot signature BIOS itself required to be there — a check
+// against a real, independently-verifiable disk rather than something
+// this driver invented for itself to pass. The slave drive carries no
+// boot code at all; it exists purely to hold the FAT16 filesystem
+// `src/fs.rs` reads from (see `Drive::Secondary`).
 // ============================================================
 
 use x86_64::instructions::port::Port;
@@ -49,8 +51,35 @@ const POLL_ATTEMPTS: u32 = 10_000_000;
 
 pub const SECTOR_SIZE: usize = 512;
 
-/// Read one 512-byte sector at LBA `lba` from the primary bus's master
-/// drive into `buf`.
+/// Which of the two drives on the primary IDE bus to address. Both share
+/// the same I/O ports (0x1F0-0x1F7) — only the drive-select bit written to
+/// `DRIVE_HEAD` differs — so supporting a second disk doesn't need a
+/// second bus's worth of ports, just this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Drive {
+    /// The disk this kernel itself boots from (QEMU's first `-drive`).
+    Primary,
+    /// A second disk attached purely for data (this kernel's FAT16
+    /// filesystem lives here — see `src/fs.rs`), independent of the boot
+    /// disk's own contents so the bootloader's sector-0 layout there is
+    /// never disturbed.
+    Secondary,
+}
+
+impl Drive {
+    /// The drive-select nibble `read_sector` ORs into `DRIVE_HEAD`: bit 4
+    /// clear selects the master drive, set selects the slave — the rest of
+    /// the byte (bits 5,6,7 and the top LBA bits) is filled in by the
+    /// caller.
+    fn select_bit(self) -> u8 {
+        match self {
+            Drive::Primary => 0x00,
+            Drive::Secondary => 0x10,
+        }
+    }
+}
+
+/// Read one 512-byte sector at LBA `lba` from `drive` into `buf`.
 ///
 /// # Panics
 /// If the drive reports an error, or never becomes ready. This is a
@@ -61,15 +90,15 @@ pub const SECTOR_SIZE: usize = 512;
 /// allocator running out of memory). A real block-device abstraction that
 /// returns `Result` is natural follow-up work once something actually
 /// needs to recover from a bad read instead of just reporting one.
-pub fn read_sector(lba: u32, buf: &mut [u8; SECTOR_SIZE]) {
+pub fn read_sector(drive: Drive, lba: u32, buf: &mut [u8; SECTOR_SIZE]) {
     assert!(lba < (1 << 28), "LBA28 only supports 28-bit sector addresses");
 
     unsafe {
         wait_until_not_busy();
 
-        // 0xE0: LBA mode, master drive, plus the top 4 bits of the LBA
-        // (bits 24-27) in the low nibble.
-        Port::<u8>::new(DRIVE_HEAD).write(0xE0 | ((lba >> 24) & 0x0F) as u8);
+        // 0xE0: LBA mode, plus the drive-select bit, plus the top 4 bits of
+        // the LBA (bits 24-27) in the low nibble.
+        Port::<u8>::new(DRIVE_HEAD).write(0xE0 | drive.select_bit() | ((lba >> 24) & 0x0F) as u8);
         Port::<u8>::new(SECTOR_COUNT).write(1);
         Port::<u8>::new(LBA_LOW).write((lba & 0xFF) as u8);
         Port::<u8>::new(LBA_MID).write(((lba >> 8) & 0xFF) as u8);

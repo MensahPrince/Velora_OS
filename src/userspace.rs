@@ -260,13 +260,17 @@ pub fn run_isolated_demo() -> ! {
 /// things easy to tell apart in diagnostics.
 const ELF_LOAD_ADDR: u64 = 0x7000_0000_0000;
 
-/// Filled in by `spawn_elf_demo` before the thread it spawns ever runs.
-/// `run_elf_demo` is a plain fn pointer (`scheduler::spawn_isolated` can't
-/// carry captured state, the same constraint `run_demo`/`run_isolated_demo`
-/// work around by hardcoding a known constant address) but the stack's
-/// placement is decided dynamically inside `elf::load`, not fixed at
-/// compile time — so it's read back from here instead of being
-/// re-derived by duplicating that placement logic.
+/// Filled in by whichever of `spawn_elf_demo` / `spawn_disk_elf_demo` last
+/// ran, before the thread it spawns ever runs. `run_elf_demo` is a plain
+/// fn pointer (`scheduler::spawn_isolated` can't carry captured state, the
+/// same constraint `run_demo`/`run_isolated_demo` work around by
+/// hardcoding a known constant address) but neither the entry point nor
+/// the stack's placement is fixed at compile time here the way it is for
+/// those two demos: `spawn_disk_elf_demo` loads whatever ELF `fs::read_file`
+/// happened to hand it, at whatever address *that* binary's own linker
+/// chose — so both are read back from here instead of being hardcoded or
+/// re-derived.
+static ELF_DEMO_ENTRY: AtomicU64 = AtomicU64::new(0);
 static ELF_DEMO_STACK_TOP: AtomicU64 = AtomicU64::new(0);
 
 /// Wraps the same read/write echo machine code `build_echo_shellcode`
@@ -336,14 +340,42 @@ pub fn spawn_elf_demo(
     run: bool,
 ) {
     let elf_bytes = build_test_elf(ELF_LOAD_ADDR);
+    spawn_loaded_elf_demo(&elf_bytes, kernel_mapper, physical_memory_offset, frame_allocator, run);
+}
+
+/// Same as `spawn_elf_demo`, but for an ELF binary read from a real
+/// filesystem (src/fs.rs) instead of built in memory — see
+/// `disk/echo.s` and `build.rs` for where `bytes` actually comes from.
+/// Kept separate from `spawn_elf_demo` (rather than one function taking
+/// an enum) because the two callers, in main.rs, genuinely differ in what
+/// they have on hand before calling: one already has `elf_bytes` sitting
+/// in memory from `fs::read_file`, the other builds them fresh each time.
+pub fn spawn_disk_elf_demo(
+    elf_bytes: &[u8],
+    kernel_mapper: &mut OffsetPageTable<'_>,
+    physical_memory_offset: VirtAddr,
+    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
+    run: bool,
+) {
+    spawn_loaded_elf_demo(elf_bytes, kernel_mapper, physical_memory_offset, frame_allocator, run);
+}
+
+fn spawn_loaded_elf_demo(
+    elf_bytes: &[u8],
+    kernel_mapper: &mut OffsetPageTable<'_>,
+    physical_memory_offset: VirtAddr,
+    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
+    run: bool,
+) {
     let (mut isolated_mapper, loaded) =
-        elf::load(&elf_bytes, physical_memory_offset, frame_allocator);
+        elf::load(elf_bytes, physical_memory_offset, frame_allocator);
 
     crate::println!(
         "loaded a real ELF binary: entry={:?} stack_top={:?}",
         loaded.entry,
         loaded.stack_top
     );
+    ELF_DEMO_ENTRY.store(loaded.entry.as_u64(), Ordering::Relaxed);
     ELF_DEMO_STACK_TOP.store(loaded.stack_top.as_u64(), Ordering::Relaxed);
 
     if run {
@@ -357,12 +389,14 @@ pub fn spawn_elf_demo(
     }
 }
 
-/// Spawned via `spawn_elf_demo`. `ELF_LOAD_ADDR` is `e_entry` by
-/// construction (see `build_test_elf`); the stack's address is read back
-/// from `ELF_DEMO_STACK_TOP` rather than hardcoded, since `elf::load`
-/// decides its placement dynamically.
+/// Spawned via `spawn_elf_demo` or `spawn_disk_elf_demo`. Both the entry
+/// point and the stack address are read back from the statics those
+/// functions filled in, rather than hardcoded — needed now that this
+/// trampoline serves two demos whose ELFs are linked at entirely
+/// different addresses (`ELF_LOAD_ADDR` for the in-memory one; whatever
+/// `disk/link.ld` chose for the on-disk one).
 pub fn run_elf_demo() -> ! {
-    let entry = VirtAddr::new(ELF_LOAD_ADDR);
+    let entry = VirtAddr::new(ELF_DEMO_ENTRY.load(Ordering::Relaxed));
     let stack_top = VirtAddr::new(ELF_DEMO_STACK_TOP.load(Ordering::Relaxed));
 
     unsafe {

@@ -25,11 +25,19 @@ futures-util = { version = "0.3.4", default-features = false, features = ["alloc
 
 
 [package.metadata.bootimage]
+# The second drive here (primary-bus slave, see src/ata.rs's `Drive`) is
+# the FAT16 filesystem disk build.rs assembles from disk/echo.s — deliberately
+# left off test-args below, so `cargo test` keeps working even before
+# `fs.img` exists (its QEMU boots from the primary drive only). `index=1`
+# pins it to that slave position rather than trusting `-drive` ordering.
+run-args = [
+    "-drive", "format=raw,file=fs.img,if=ide,index=1"
+]
 test-args = [
     "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04", "-serial", "stdio",
     "-display", "none"
 ]
-test-success-exit-code = 33 
+test-success-exit-code = 33
 test-timeout =  300
 
 

@@ -1,2 +1,6 @@
 /target
 /bootimage
+
+# The FAT16 disk image build.rs assembles disk/echo.s onto (see src/fs.rs)
+# — a generated build artifact, not source; regenerated automatically.
+/fs.img
