@@ -40,6 +40,15 @@ lazy_static! {
         idt[(PIC_2_OFFSET + 6) as usize].set_handler_fn(irq14_handler);
         idt[(PIC_2_OFFSET + 7) as usize].set_handler_fn(irq15_handler);
 
+        // The demo syscall gate (src/userspace.rs). DPL 3 so ring-3 code
+        // is actually allowed to reach it with `int 0x80` — every other
+        // gate above defaults to DPL 0, meaning only the kernel itself
+        // could ever trigger them with a software `int`, which is what we
+        // want for those.
+        idt[SYSCALL_VECTOR as usize]
+            .set_handler_fn(syscall_handler)
+            .set_privilege_level(x86_64::PrivilegeLevel::Ring3);
+
         idt
     };
 }
@@ -86,6 +95,21 @@ extern "x86-interrupt" fn general_protection_fault_handler(
         "EXCEPTION: GENERAL PROTECTION FAULT\nError Code: {:#x}\n{:#?}",
         error_code, stack_frame
     );
+}
+
+// The demo syscall vector ring-3 code (src/userspace.rs) reaches via
+// `int 0x80`. 0x80 sits well clear of both the CPU exception range (0-31)
+// and the PIC's hardware IRQ range (32-47), so it can't collide with
+// either.
+const SYSCALL_VECTOR: u8 = 0x80;
+
+// Doesn't do anything with the caller yet — no register-based argument
+// passing, no return value — this only exists to prove the mechanism
+// (ring 3 -> int 0x80 -> here -> back to ring 3) actually works. A real
+// syscall ABI (reading arguments out of the interrupted registers, not
+// just the fixed fields `x86-interrupt` exposes) is follow-up work.
+extern "x86-interrupt" fn syscall_handler(_stack_frame: InterruptStackFrame) {
+    println!("[kernel] got a syscall from ring 3");
 }
 
 // IPC Interrupts

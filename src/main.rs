@@ -100,6 +100,17 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
         velora_os::scheduler::spawn(demo_thread_b);
     }
 
+    // Ring 3 (user-mode) demo: map a small hand-written shellcode page,
+    // then spawn a thread that drops into it and runs it at CPL 3 — see
+    // src/userspace.rs. Not spawned in test builds, same reasoning as the
+    // scheduler demo threads above: it prints in the background, which
+    // would race with tests that check exact VGA buffer contents.
+    #[cfg(not(test))]
+    {
+        velora_os::userspace::map_demo_page(&mut mapper, &mut frame_allocator);
+        velora_os::scheduler::spawn(velora_os::userspace::run_demo);
+    }
+
     // Commented out while focusing on paging — re-enable to run the test suite.
     #[cfg(test)]
     test_main();
