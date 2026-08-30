@@ -30,6 +30,7 @@ pub mod serial;
 pub mod vga_buffer;
 pub mod memory;
 pub mod task;
+pub mod scheduler;
 use core::panic::PanicInfo;
 
 

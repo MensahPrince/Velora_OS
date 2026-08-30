@@ -143,6 +143,11 @@ unhandled_pic_interrupt!(irq13_handler, PIC_2_OFFSET + 5);
 unhandled_pic_interrupt!(irq14_handler, PIC_2_OFFSET + 6);
 unhandled_pic_interrupt!(irq15_handler, PIC_2_OFFSET + 7);
 
+// The EOI must happen before scheduler::tick(): tick() may switch to a
+// different thread's stack, in which case this specific call doesn't
+// "return" here again until that thread is scheduled back in — possibly a
+// long time from now. Acknowledging the interrupt has to happen right
+// away regardless, or the PIC would never deliver another timer interrupt.
 extern "x86-interrupt" fn timer_interrupt_handler(
     _stack_frame: InterruptStackFrame)
 {
@@ -150,6 +155,7 @@ extern "x86-interrupt" fn timer_interrupt_handler(
         PICS.lock()
             .notify_end_of_interrupt(InterruptIndex::Timer.as_u8());
     }
+    crate::scheduler::tick();
 }
 
 // in/src/interrupts.rs
