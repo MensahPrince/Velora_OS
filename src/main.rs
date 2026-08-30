@@ -122,12 +122,25 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     // address space rather than the kernel's shared one — see
     // src/userspace.rs and src/memory.rs (`new_address_space`). Proven by
     // checking, right here, in the *kernel's own* page tables, whether the
-    // isolated demo's page is visible at all.
+    // isolated demo's page is visible at all — that check only means
+    // something if the page actually got mapped somewhere, so
+    // spawn_isolated_demo always does that part regardless of `run`.
+    //
+    // `run: false`: actually executing the demo thread works (verified —
+    // it echoes typed characters back via its own sys_read/sys_write), but
+    // left on permanently every keystroke shows up twice: once from the
+    // kernel's own keyboard task, once from this. Flip to `true` to
+    // re-verify the syscall ABI end to end.
     #[cfg(not(test))]
     {
         use x86_64::structures::paging::Translate;
 
-        velora_os::userspace::spawn_isolated_demo(&mut mapper, phys_mem_offset, &mut frame_allocator);
+        velora_os::userspace::spawn_isolated_demo(
+            &mut mapper,
+            phys_mem_offset,
+            &mut frame_allocator,
+            false,
+        );
 
         let isolated_addr = VirtAddr::new(velora_os::userspace::ISOLATED_USER_PAGE_ADDR);
         println!(

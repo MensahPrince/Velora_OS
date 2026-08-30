@@ -188,17 +188,23 @@ pub fn map_demo_page(
     map_shellcode_page(mapper, frame_allocator, physical_memory_offset, USER_PAGE_ADDR);
 }
 
-/// Build a fresh, isolated address space, map the (identical) demo
-/// shellcode into it at `ISOLATED_USER_PAGE_ADDR`, and spawn a thread that
-/// drops into it — that thread's page table is this new, separate one, not
-/// the kernel's own, so it runs genuinely isolated from everything else in
-/// this kernel (see the module docs). `kernel_mapper` is the caller's own
-/// (shared) mapper, needed so the new thread's kernel-mode stack can be
-/// shared into the isolated table too (see `scheduler::spawn_isolated`).
+/// Build a fresh, isolated address space and map the (identical) demo
+/// shellcode into it at `ISOLATED_USER_PAGE_ADDR` — that address space is
+/// what `main.rs` checks its own page tables against to prove isolation,
+/// so this part always happens. Actually *running* it (`run: true`) spawns
+/// a thread that drops into it, which starts echoing typed characters
+/// straight back via its own sys_read/sys_write calls — a good one-time
+/// proof the syscall ABI works end to end, but if left on permanently
+/// every keystroke shows up twice (once from the kernel's own keyboard
+/// task, once from this), which reads as a bug rather than a feature.
+/// `kernel_mapper` is the caller's own (shared) mapper, needed so the new
+/// thread's kernel-mode stack can be shared into the isolated table too
+/// (see `scheduler::spawn_isolated`).
 pub fn spawn_isolated_demo(
     kernel_mapper: &mut OffsetPageTable<'_>,
     physical_memory_offset: VirtAddr,
     frame_allocator: &mut impl FrameAllocator<Size4KiB>,
+    run: bool,
 ) {
     let (l4_frame, mut isolated_mapper) =
         unsafe { memory::new_address_space(physical_memory_offset, frame_allocator) };
@@ -210,13 +216,15 @@ pub fn spawn_isolated_demo(
         ISOLATED_USER_PAGE_ADDR,
     );
 
-    scheduler::spawn_isolated(
-        run_isolated_demo,
-        l4_frame,
-        kernel_mapper,
-        &mut isolated_mapper,
-        frame_allocator,
-    );
+    if run {
+        scheduler::spawn_isolated(
+            run_isolated_demo,
+            l4_frame,
+            kernel_mapper,
+            &mut isolated_mapper,
+            frame_allocator,
+        );
+    }
 }
 
 /// Spawned as a scheduler thread (`scheduler::spawn(run_demo)`). Drops to
