@@ -107,7 +107,6 @@ cargo test    # execute the integration test suite (headless)
 
 ## Known Limitations
 
-- **Single concurrent ring-3 thread.** The privilege-transition stack (`TSS.RSP0`) is a single, statically allocated region shared by every thread; running two ring-3 threads concurrently corrupts this shared state. A per-thread `RSP0`, swapped by the scheduler alongside the CR3 switch, is the identified fix and has not yet been implemented.
 - **ELF loader constraints.** Only statically linked, non-PIE executables with page-aligned `PT_LOAD` segments are supported; there is no relocation processing, dynamic linking, or section-header parsing.
 - **No filesystem.** The ATA driver reads raw sectors only; there is no partition table or filesystem parser, so loading an arbitrary file from disk is not yet possible.
 - **No NX enforcement.** `EFER.NXE` is not enabled, so the page table's `NO_EXECUTE` bit is not currently meaningful.
@@ -115,7 +114,7 @@ cargo test    # execute the integration test suite (headless)
 
 ## Future Work
 
-In approximate dependency order: a per-thread privilege-transition stack, removing the single-ring-3-thread constraint; a minimal filesystem sufficient to load an ELF binary from disk rather than an embedded test payload; process lifecycle management (`exit`, and eventually `fork`/`exec`-equivalent primitives); and an expanded system-call surface.
+In approximate dependency order: a minimal filesystem sufficient to load an ELF binary from disk rather than an embedded test payload; process lifecycle management (`exit`, and eventually `fork`/`exec`-equivalent primitives); and an expanded system-call surface.
 
 ## References
 
