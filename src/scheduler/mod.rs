@@ -21,6 +21,7 @@ mod context;
 use crate::gdt;
 use crate::memory;
 use alloc::alloc::Layout;
+use alloc::vec::Vec;
 use spin::Mutex;
 use x86_64::{
     VirtAddr,
@@ -79,7 +80,38 @@ struct Thread {
     /// has no kernel-allocated stack of its own and is never expected to
     /// enter ring 3.
     kernel_stack_top: u64,
+    /// This thread's own open files (`syscall::SYS_OPEN`/`SYS_READ`/
+    /// `SYS_CLOSE`) — per-thread rather than one shared table, so an
+    /// isolated process can't see or exhaust another's file descriptors,
+    /// matching the isolation this kernel already enforces for memory.
+    /// Each `Some` slot's index (offset by `FIRST_FILE_FD`) *is* the fd a
+    /// ring-3 caller was handed back. Dropped automatically — freeing
+    /// whatever `Vec` each open file buffered — when `Thread` itself is
+    /// dropped at the end of `reap_zombie`, by which point CR3 is already
+    /// forced back to the shared kernel table (see that function), so the
+    /// heap these `Vec`s are backed by is guaranteed mapped.
+    open_files: [Option<OpenFile>; MAX_OPEN_FILES],
 }
+
+/// A file `syscall::SYS_OPEN` has already read in full from `fs::read_file`
+/// — this kernel's filesystem driver has no partial/streaming read of its
+/// own, so the whole thing is buffered up front, and `SYS_READ` just slices
+/// out of it, advancing `offset` as it goes.
+struct OpenFile {
+    data: Vec<u8>,
+    offset: usize,
+}
+
+/// How many files a single thread can have open at once — small and fixed,
+/// same reasoning as `MAX_THREADS`: nothing here needs to grow, so nothing
+/// here needs to allocate a resizable container just to hold a handful of
+/// slots.
+pub const MAX_OPEN_FILES: usize = 4;
+
+/// The lowest fd `syscall::SYS_OPEN` will ever hand back — 0 and 1 stay
+/// permanently reserved for stdin/stdout (`syscall::sys_read`/`sys_write`),
+/// so a real open file's fd never collides with either.
+pub const FIRST_FILE_FD: u64 = 2;
 
 /// A fixed-capacity FIFO of thread ids — deliberately not a heap-backed
 /// `VecDeque`. `schedule()` runs from inside the timer ISR, which can fire
@@ -169,6 +201,7 @@ pub fn init() {
                 entry: None,
                 page_table: None,
                 kernel_stack_top: 0,
+                open_files: core::array::from_fn(|_| None),
             })
         } else {
             None
@@ -201,6 +234,88 @@ pub fn kernel_page_table() -> PhysFrame {
             .as_ref()
             .expect("scheduler not initialized")
             .kernel_page_table
+    })
+}
+
+/// Run `f` with mutable access to the *currently running* thread's own
+/// state, having first forced CR3 to the shared kernel address space (and
+/// restored whatever was active before, once `f` returns) — the shared
+/// precondition every file-descriptor accessor below needs:
+/// `Thread::open_files` holds heap-backed `Vec`s, and an isolated caller's
+/// own CR3 doesn't map the kernel heap at all (same reasoning as
+/// `reap_zombie`'s own CR3 handling, and `syscall::sys_read`'s existing
+/// keyboard-queue case this mirrors). SCHEDULER's own lock is taken and
+/// released within this call, not held across it.
+fn with_current_thread<R>(f: impl FnOnce(&mut Thread) -> R) -> R {
+    interrupts::without_interrupts(|| {
+        let (caller_page_table, flags) = Cr3::read();
+        let mut guard = SCHEDULER.lock();
+        let state = guard.as_mut().expect("scheduler not initialized");
+        let needs_switch = caller_page_table != state.kernel_page_table;
+        if needs_switch {
+            unsafe { Cr3::write(state.kernel_page_table, flags) };
+        }
+
+        let thread = state.threads[state.current]
+            .as_mut()
+            .expect("current thread missing from thread table");
+        let result = f(thread);
+
+        if needs_switch {
+            unsafe { Cr3::write(caller_page_table, flags) };
+        }
+        result
+    })
+}
+
+/// Buffer `data` — the full contents of a file `fs::read_file` already
+/// read — as a newly open file in the *currently running* thread's own
+/// descriptor table, and return the fd assigned to it, or `None` if that
+/// table (`MAX_OPEN_FILES`) is already full. Reached from
+/// `syscall::sys_open`, once `fs::read_file` has already done the actual
+/// disk work; this just takes ownership of the result and hands back a
+/// handle a ring-3 caller can pass to later `read`/`close` calls.
+pub fn open_file(data: Vec<u8>) -> Option<u64> {
+    with_current_thread(|thread| {
+        let slot = thread.open_files.iter().position(Option::is_none)?;
+        thread.open_files[slot] = Some(OpenFile { data, offset: 0 });
+        Some(slot as u64 + FIRST_FILE_FD)
+    })
+}
+
+/// Copy up to `buf.len()` bytes out of the currently running thread's open
+/// file `fd`, starting wherever the last `read_open_file` call for this
+/// same fd left off, and advance that position by however much was
+/// actually copied. Returns the number of bytes copied (0 once the file is
+/// exhausted — this never blocks, there's nothing left to wait for), or
+/// `None` if `fd` isn't a file this thread currently has open.
+pub fn read_open_file(fd: u64, buf: &mut [u8]) -> Option<usize> {
+    with_current_thread(|thread| {
+        let slot = fd.checked_sub(FIRST_FILE_FD)? as usize;
+        let file = thread.open_files.get_mut(slot)?.as_mut()?;
+        let remaining = &file.data[file.offset..];
+        let count = remaining.len().min(buf.len());
+        buf[..count].copy_from_slice(&remaining[..count]);
+        file.offset += count;
+        Some(count)
+    })
+}
+
+/// Close the currently running thread's open file `fd`, freeing its
+/// buffered contents immediately rather than waiting for the thread to
+/// exit. Returns whether `fd` was actually an open file to begin with.
+pub fn close_file(fd: u64) -> bool {
+    with_current_thread(|thread| {
+        let Some(slot) = fd.checked_sub(FIRST_FILE_FD) else {
+            return false;
+        };
+        match thread.open_files.get_mut(slot as usize) {
+            Some(entry @ Some(_)) => {
+                *entry = None;
+                true
+            }
+            _ => false,
+        }
     })
 }
 
@@ -237,6 +352,7 @@ pub fn spawn(entry: fn() -> !) {
             entry: Some(entry),
             page_table: None,
             kernel_stack_top: stack_base as u64 + STACK_SIZE as u64,
+            open_files: core::array::from_fn(|_| None),
         });
         state.ready_queue.push_back(id);
     });
@@ -315,6 +431,7 @@ pub fn spawn_isolated(
             entry: Some(entry),
             page_table: Some(page_table),
             kernel_stack_top: stack_base as u64 + STACK_SIZE as u64,
+            open_files: core::array::from_fn(|_| None),
         });
         state.ready_queue.push_back(id);
     });

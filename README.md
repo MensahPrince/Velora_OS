@@ -33,7 +33,7 @@ The project exists to develop a rigorous, from-scratch understanding of the mech
 ### Privilege Isolation and System Calls
 
 - The kernel constructs ring-3 (user-mode) GDT segments and transitions execution to CPL 3 via a manually constructed `IRETQ` frame.
-- A register-based system-call ABI is exposed through a software interrupt (`int 0x80`), serviced by a hand-written entry stub that preserves the full general-purpose register set. This is necessary because the `x86-interrupt` calling convention cannot expose arbitrary registers to handler code: the compiler's generated prologue relocates them before user code runs. Three calls are currently implemented: `write(fd, buf, len)`, `read(fd, buf, len)`, and `exit()`.
+- A register-based system-call ABI is exposed through a software interrupt (`int 0x80`), serviced by a hand-written entry stub that preserves the full general-purpose register set. This is necessary because the `x86-interrupt` calling convention cannot expose arbitrary registers to handler code: the compiler's generated prologue relocates them before user code runs. Five calls are currently implemented: `write(fd, buf, len)`, `read(fd, buf, len)`, `exit()`, `open(path, path_len)`, and `close(fd)`. `open` looks a file up by path through `fs::read_file` and buffers its full contents (this filesystem driver has no partial/streaming read of its own) in a per-thread file-descriptor table — capped at a small, fixed number of slots per thread, and reachable only by the thread that opened it — so an isolated process can't see or exhaust another's open files, the same isolation this kernel already enforces for memory; `read` on a returned fd slices out of that buffer, and any files still open at exit are freed automatically alongside the rest of that thread's own state.
 
 ### Process Loading and Lifecycle
 
@@ -107,7 +107,7 @@ cargo test    # execute the integration test suite (headless)
 | Cooperative async task execution | Implemented |
 | Ring-3 execution | Implemented |
 | Isolated address spaces (per-process paging) | Implemented |
-| System-call interface | Implemented (`read`, `write`, `exit`) |
+| System-call interface | Implemented (`read`, `write`, `exit`, `open`, `close`) |
 | ELF64 loading | Implemented (static `PT_LOAD` executables only) |
 | Disk I/O | Implemented (PIO sector reads, primary + secondary drive) |
 | Filesystem | Implemented (read-only FAT16: file lookup by 8.3 name, cluster-chain reads) |
@@ -121,7 +121,7 @@ cargo test    # execute the integration test suite (headless)
 
 ## Future Work
 
-In approximate dependency order: `fork`/`exec`-equivalent primitives built on top of the now-working spawn/exit lifecycle (including full address-space reclamation); an expanded system-call surface (e.g. an `open`/`read`-by-path pair backed by `fs.rs`, rather than only the kernel's own boot-time demo calling it directly); and, further out, filesystem writes and subdirectory support.
+In approximate dependency order: `fork`/`exec`-equivalent primitives built on top of the now-working spawn/exit lifecycle (including full address-space reclamation); a real `copy_from_user` (checking a caller-supplied pointer's mapping before dereferencing it, or handling the resulting fault, rather than trusting it and panicking the whole kernel on a bad one — `sys_write`/`sys_read`/`sys_open` all still take this shortcut); and, further out, filesystem writes and subdirectory support.
 
 ## References
 

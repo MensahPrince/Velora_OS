@@ -105,8 +105,30 @@ fn build_fs_image(
         .arg(&elf)
         .arg("::ECHO.ELF"))?;
 
+    // A second, plain-text file — for `userspace::spawn_open_read_demo`
+    // (src/userspace.rs) to open and read back through a real ring-3
+    // syscall::SYS_OPEN/SYS_READ round trip and print, proving that path
+    // end to end with genuinely printable output. ECHO.ELF itself would
+    // technically work too (fs::read_file doesn't care what kind of file
+    // it's handed), but its bytes are machine code, not valid UTF-8 —
+    // sys_write would just report "invalid utf-8" instead of anything a
+    // human can actually read as confirmation.
+    let hello_txt = out_dir.join("hello.txt");
+    std::fs::write(&hello_txt, HELLO_TXT_CONTENTS)
+        .map_err(|e| format!("failed to write {}: {e}", hello_txt.display()))?;
+    run(Command::new("mcopy")
+        .arg("-i")
+        .arg(fs_image)
+        .arg(&hello_txt)
+        .arg("::HELLO.TXT"))?;
+
     Ok(())
 }
+
+/// Kept in sync with `userspace::OPEN_READ_DEMO_READ_LEN` (src/userspace.rs)
+/// — that demo's read buffer must be at least this long, or its one read()
+/// call won't come back with the whole message.
+const HELLO_TXT_CONTENTS: &[u8] = b"hello from the on-disk filesystem, opened via sys_open\n";
 
 /// A fixed-size, all-zero file — not a valid FAT16 volume (its "boot
 /// sector" reads back as `bytes_per_sector == 0`), but enough for QEMU to

@@ -52,7 +52,8 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     // If we returned, the CPU would execute random garbage memory.
 
     // Print our first message to the VGA screen
-    println!("Welcome to Velora_OS{}", "!");
+    println!("Velora OS");
+    println!("=========");
 
     // Load the GDT/IDT and remap the PICs. Hardware interrupts (timer,
     // keyboard) stay masked until we explicitly enable them further down —
@@ -105,14 +106,11 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
         let mut sector = [0u8; velora_os::ata::SECTOR_SIZE];
         velora_os::ata::read_sector(velora_os::ata::Drive::Primary, 0, &mut sector);
         let has_boot_signature = sector[510] == 0x55 && sector[511] == 0xAA;
-        println!(
-            "ATA: read sector 0 from the boot disk, boot signature {}",
-            if has_boot_signature {
-                "present (0x55AA) — real disk I/O works"
-            } else {
-                "MISSING — something is wrong with the ATA driver"
-            }
-        );
+        if has_boot_signature {
+            println!("[ata]   boot sector read back OK (0x55AA signature present)");
+        } else {
+            println!("[ata]   FAILED — boot signature missing, something is wrong with the ATA driver");
+        }
     }
 
     // Two demo kernel threads that proved the scheduler actually preempts
@@ -175,11 +173,11 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
         );
 
         let isolated_addr = VirtAddr::new(velora_os::userspace::ISOLATED_USER_PAGE_ADDR);
-        println!(
-            "kernel's own view of the isolated demo's page: {:?} (should be None — \
-             it's only mapped in that demo's own address space)",
-            mapper.translate_addr(isolated_addr)
-        );
+        if mapper.translate_addr(isolated_addr).is_none() {
+            println!("[proc]  isolation OK — kernel cannot see the isolated demo's page");
+        } else {
+            println!("[proc]  FAILED — kernel can still see the isolated demo's page");
+        }
     }
 
     // A real ELF loader (src/elf.rs): the same read/write echo behavior
@@ -211,7 +209,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     {
         match velora_os::fs::read_file("ECHO.ELF") {
             Some(elf_bytes) => {
-                println!("fs: read ECHO.ELF ({} bytes) off the FAT16 disk", elf_bytes.len());
+                println!("[fs]    read ECHO.ELF ({} bytes) off the FAT16 disk", elf_bytes.len());
                 velora_os::userspace::spawn_disk_elf_demo(
                     &elf_bytes,
                     &mut mapper,
@@ -221,9 +219,24 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                 );
             }
             None => println!(
-                "fs: ECHO.ELF not found on the FAT16 disk (was fs.img built? see build.rs)"
+                "[fs]    ECHO.ELF not found on the FAT16 disk (was fs.img built? see build.rs)"
             ),
         }
+    }
+
+    // The syscall surface, expanded past read/write/exit: `SYS_OPEN`/
+    // `SYS_CLOSE` (src/syscall.rs), backed by a real per-thread file-
+    // descriptor table (src/scheduler.rs) and `fs::read_file` underneath —
+    // a ring-3 program opening a file *by path*, through the syscall ABI,
+    // rather than only the kernel's own boot-time code calling
+    // `fs::read_file` directly the way the ELF demos above do. Unlike
+    // those, `run: true` here permanently: the demo reads and prints one
+    // small file exactly once and exits for good, rather than looping
+    // forever the way an stdin-echo demo would.
+    #[cfg(not(test))]
+    {
+        println!("[fs]    HELLO.TXT via ring-3 sys_open/sys_read/sys_write:");
+        velora_os::userspace::spawn_open_read_demo(&mut mapper, phys_mem_offset, &mut frame_allocator, true);
     }
 
     // Process lifecycle (src/scheduler.rs's exit_current_thread, reached
@@ -231,24 +244,21 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     // would reach the same function via syscall::SYS_EXIT instead):
     // spawns more short-lived threads, one at a time, than the scheduler's
     // fixed-size thread table (MAX_THREADS = 16) has slots for. Each one
-    // prints, exits immediately, and is `yield_now()`-ed into and back out
-    // of before the next is spawned — so at most one extra thread is ever
-    // alive at once, and the *next* iteration's `spawn` can only succeed
-    // if the previous thread's slot (and kernel stack) really was freed,
-    // not just marked "done" and left occupied. Without real reclamation
-    // this panics ("thread table full") well before the loop finishes;
-    // unlike the demos above, it's left permanently enabled (not gated by
-    // a `run` flag) since it's finite and quiet rather than printing
-    // forever in the background.
+    // exits immediately and is `yield_now()`-ed into and back out of before
+    // the next is spawned — so at most one extra thread is ever alive at
+    // once, and the *next* iteration's `spawn` can only succeed if the
+    // previous thread's slot (and kernel stack) really was freed, not just
+    // marked "done" and left occupied. Without real reclamation this panics
+    // ("thread table full") well before the loop finishes; unlike the
+    // demos above, it's left permanently enabled (not gated by a `run`
+    // flag) since it's finite and quiet rather than printing forever in
+    // the background.
     #[cfg(not(test))]
     for i in 0..40u32 {
         velora_os::scheduler::spawn(exit_demo_thread);
         velora_os::scheduler::yield_now();
         if i == 39 {
-            println!(
-                "scheduler: spawned and exited 40 threads through a 16-slot table \
-                 without exhausting it — exit reclamation works"
-            );
+            println!("[sched] 40 threads spawned/exited through a 16-slot table OK");
         }
     }
 
@@ -300,17 +310,14 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
         );
         velora_os::scheduler::yield_now();
     }
-    println!(
-        "scheduler: spawned and exited 20 isolated (per-process) threads, each freed back \
-         through memory::free_address_space — kernel still healthy afterward"
-    );
+    println!("[sched] 20 isolated address spaces spawned/exited and fully reclaimed OK");
 
     // Commented out while focusing on paging — re-enable to run the test suite.
     #[cfg(test)]
     test_main();
 
-    // A message to prove that the OS is running
-    println!("Velora_OS did not crash");
+    println!();
+    println!("Velora OS ready — type to test the keyboard echo.");
 
     // Hand off to the cooperative-multitasking executor. It never returns:
     // it polls ready tasks and `hlt`s the CPU whenever there's nothing to
@@ -358,24 +365,29 @@ fn run_bringup_demo(
     // has real page-fault and double-fault handlers, so this no longer
     // happens; kept here as a note since it's a rite of passage in OS dev.
 
-    //allocate a number on the heap and print it
+    //allocate a number on the heap
     let heap_value = Box::new(41);
-    println!("Heap_value at {:p}", heap_value);
 
-    //create a dynamically sized vector and print it
+    //create a dynamically sized vector
     let mut vec = Vec::new();
     for i in 1..500 {
         vec.push(i);
     }
 
-    println!("Vec at {:p}", vec.as_slice());
-
     // create a reference counted vector -> will be freed when count reaches 0
     let reference_counted = Rc::new(vec![1, 2, 3]);
     let cloned_reference = reference_counted.clone();
-    println!("current reference count is {}", Rc::strong_count(&cloned_reference));
+    let refcount_before_drop = Rc::strong_count(&cloned_reference);
     core::mem::drop(reference_counted);
-    println!("reference count is {} now", Rc::strong_count(&cloned_reference));
+    let refcount_after_drop = Rc::strong_count(&cloned_reference);
+
+    println!(
+        "[mem]   heap OK — Box at {:p}, Vec at {:p}, Rc refcount {} -> {}",
+        heap_value,
+        vec.as_ptr(),
+        refcount_before_drop,
+        refcount_after_drop,
+    );
 }
 
 // ------------------------------------------------------------------
@@ -396,12 +408,14 @@ fn demo_thread_a() -> ! {
 }
 
 /// Spawned repeatedly by the process-lifecycle demo in `kernel_main` — see
-/// its comment there. Runs once, prints, and exits for good via
+/// its comment there. Runs once and exits for good via
 /// `scheduler::exit_current_thread()`: unlike every other demo thread in
-/// this file, this one is meant to actually finish.
+/// this file, this one is meant to actually finish. Deliberately silent —
+/// spawned 40 times in a row, printing anything per-iteration here would
+/// just flood the console; `kernel_main` prints one summary line once the
+/// whole loop finishes instead.
 #[cfg(not(test))]
 fn exit_demo_thread() -> ! {
-    println!("[exit demo] running, exiting now");
     velora_os::scheduler::exit_current_thread();
 }
 

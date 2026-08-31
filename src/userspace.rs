@@ -80,18 +80,32 @@ pub const ISOLATED_USER_PAGE_ADDR: u64 = 0x6000_0000_0000;
 /// to debug once it's wrong — a bad jump target here would land execution
 /// on an arbitrary instruction boundary (or none), with no guarantee of
 /// hitting a byte sequence that even decodes as valid x86-64.
-fn build_echo_shellcode(page_addr: u64) -> Vec<u8> {
-    fn mov_imm64(code: &mut Vec<u8>, reg_opcode: u8, value: u64) {
-        code.push(0x48); // REX.W
-        code.push(0xB8 + reg_opcode);
-        code.extend_from_slice(&value.to_le_bytes());
-    }
-    // B8+r register encoding.
-    const RAX: u8 = 0;
-    const RDX: u8 = 2;
-    const RSI: u8 = 6;
-    const RDI: u8 = 7;
+/// `mov r64, imm64` (opcode `B8+r`) — encodes `mov <reg_opcode's register>,
+/// value`. Shared by every shellcode builder in this module.
+fn mov_imm64(code: &mut Vec<u8>, reg_opcode: u8, value: u64) {
+    code.push(0x48); // REX.W
+    code.push(0xB8 + reg_opcode);
+    code.extend_from_slice(&value.to_le_bytes());
+}
 
+/// `mov r/m64, r64` (opcode `89 /r`), restricted to the register-to-register
+/// form (`mod == 11`) every shellcode builder here actually needs — moves
+/// `src`'s value into `dst`.
+fn mov_r64_r64(code: &mut Vec<u8>, dst: u8, src: u8) {
+    code.push(0x48); // REX.W
+    code.push(0x89);
+    code.push(0xC0 | (src << 3) | dst);
+}
+
+// Register encodings shared by every shellcode builder below (the plain
+// `B8+r`/ModRM forms above only reach the low 8 GPRs, which is all any of
+// this demo code needs).
+const RAX: u8 = 0;
+const RDX: u8 = 2;
+const RSI: u8 = 6;
+const RDI: u8 = 7;
+
+fn build_echo_shellcode(page_addr: u64) -> Vec<u8> {
     let mut code = Vec::new();
     let read_loop = code.len();
 
@@ -137,11 +151,11 @@ fn rel8(target_offset: usize, next_instruction_offset: usize) -> u8 {
     i8::try_from(delta).expect("shellcode jump target out of rel8 range") as u8
 }
 
-/// Map a demo code+stack page at `addr` in `mapper` and copy the shellcode
-/// into it. The code lives at the start of the page; the stack (unused by
-/// this shellcode — it never pushes anything) grows down from the page's
-/// end, sharing the same page since this demo is small enough that the two
-/// can't realistically collide.
+/// Map a demo code+stack page at `addr` in `mapper` and copy `code` into
+/// it. The code lives at the start of the page; the stack (unused by every
+/// shellcode this module builds — none of them ever push anything) grows
+/// down from the page's end, sharing the same page since these demos are
+/// small enough that the two can't realistically collide.
 ///
 /// The shellcode is written through `physical_memory_offset + frame`, not
 /// through `addr` itself: `addr` is only guaranteed to be mapped once
@@ -156,6 +170,7 @@ fn map_shellcode_page(
     frame_allocator: &mut impl FrameAllocator<Size4KiB>,
     physical_memory_offset: VirtAddr,
     addr: u64,
+    code: &[u8],
 ) {
     let page = Page::containing_address(VirtAddr::new(addr));
     let frame = frame_allocator
@@ -170,10 +185,9 @@ fn map_shellcode_page(
             .flush();
     }
 
-    let shellcode = build_echo_shellcode(addr);
     let code_ptr = (physical_memory_offset + frame.start_address().as_u64()).as_mut_ptr::<u8>();
     unsafe {
-        core::ptr::copy_nonoverlapping(shellcode.as_ptr(), code_ptr, shellcode.len());
+        core::ptr::copy_nonoverlapping(code.as_ptr(), code_ptr, code.len());
     }
 }
 
@@ -186,7 +200,8 @@ pub fn map_demo_page(
     physical_memory_offset: VirtAddr,
     frame_allocator: &mut impl FrameAllocator<Size4KiB>,
 ) {
-    map_shellcode_page(mapper, frame_allocator, physical_memory_offset, USER_PAGE_ADDR);
+    let code = build_echo_shellcode(USER_PAGE_ADDR);
+    map_shellcode_page(mapper, frame_allocator, physical_memory_offset, USER_PAGE_ADDR, &code);
 }
 
 /// Build a fresh, isolated address space and map the (identical) demo
@@ -210,11 +225,13 @@ pub fn spawn_isolated_demo(
     let (l4_frame, mut isolated_mapper) =
         unsafe { memory::new_address_space(physical_memory_offset, frame_allocator) };
 
+    let code = build_echo_shellcode(ISOLATED_USER_PAGE_ADDR);
     map_shellcode_page(
         &mut isolated_mapper,
         frame_allocator,
         physical_memory_offset,
         ISOLATED_USER_PAGE_ADDR,
+        &code,
     );
 
     if run {
@@ -248,6 +265,147 @@ pub fn run_demo() -> ! {
 pub fn run_isolated_demo() -> ! {
     let entry = VirtAddr::new(ISOLATED_USER_PAGE_ADDR);
     let stack_top = VirtAddr::new(ISOLATED_USER_PAGE_ADDR + 4096 - 16);
+
+    unsafe {
+        enter_ring3(entry, stack_top);
+    }
+}
+
+/// Where the open/read demo's code+stack page lives — a P4 slot nothing
+/// else in this kernel uses, same reasoning as `USER_PAGE_ADDR`.
+const OPEN_READ_DEMO_ADDR: u64 = 0x7500_0000_0000;
+
+/// The 8.3 name `build.rs` copies a small plain-text file onto `fs.img`
+/// as, purely for this demo to open — deliberately not `ECHO.ELF` itself
+/// (which `fs::read_file` would happily hand back too): that file's
+/// contents are machine code, not valid UTF-8, so `sys_write` would just
+/// report "invalid utf-8" instead of anything a human can read as
+/// confirmation the round trip actually worked.
+const OPEN_READ_DEMO_PATH: &[u8] = b"HELLO.TXT";
+
+/// Read buffer size for the demo's one `sys_read` call — must be at least
+/// as long as `HELLO_TXT_CONTENTS` in build.rs, or the message would come
+/// back truncated (56 comfortably covers the fixed message that build.rs
+/// writes there).
+const OPEN_READ_DEMO_READ_LEN: u64 = 64;
+
+/// Builds:
+///
+/// ```text
+///     mov rax, SYS_OPEN
+///     mov rdi, path_addr        ; "HELLO.TXT"
+///     mov rsi, path_len
+///     int 0x80                  ; rax = fd (or u64::MAX)
+///     mov rdi, rax               ; fd -> rdi for the read below
+///     mov rax, SYS_READ
+///     mov rsi, buf_addr
+///     mov rdx, OPEN_READ_DEMO_READ_LEN
+///     int 0x80                   ; rax = bytes actually read
+///     mov rdx, rax                ; len for write = bytes read
+///     mov rax, SYS_WRITE
+///     mov rdi, 1                   ; fd = stdout
+///     mov rsi, buf_addr
+///     int 0x80                      ; print whatever was actually read
+///     mov rax, SYS_EXIT
+///     int 0x80                       ; never returns
+/// path: "HELLO.TXT"
+/// buf: <OPEN_READ_DEMO_READ_LEN bytes scratch>
+/// ```
+///
+/// No error handling beyond what falls out naturally: if `open` fails,
+/// `fd` comes back as `u64::MAX`, `read` on a bogus fd returns `u64::MAX`
+/// too (`scheduler::read_open_file` finds no such slot), and `write` with
+/// `len = u64::MAX` gets capped to `sys_write`'s own 1024-byte limit and
+/// prints whatever garbage happens to be in `buf` — visibly wrong on
+/// screen rather than a silent success, which is enough for a demo whose
+/// entire job is to be watched succeed once at boot, not to be a robust
+/// ring-3 program.
+fn build_open_read_shellcode(page_addr: u64) -> Vec<u8> {
+    let mut code = Vec::new();
+
+    mov_imm64(&mut code, RAX, syscall::SYS_OPEN);
+    let path_ptr_patch_at = code.len() + 2;
+    mov_imm64(&mut code, RDI, 0); // path_addr, patched in below
+    mov_imm64(&mut code, RSI, OPEN_READ_DEMO_PATH.len() as u64);
+    code.extend_from_slice(&[0xcd, 0x80]); // int 0x80
+    mov_r64_r64(&mut code, RDI, RAX); // fd -> rdi
+
+    mov_imm64(&mut code, RAX, syscall::SYS_READ);
+    let read_buf_patch_at = code.len() + 2;
+    mov_imm64(&mut code, RSI, 0); // buf_addr, patched in below
+    mov_imm64(&mut code, RDX, OPEN_READ_DEMO_READ_LEN);
+    code.extend_from_slice(&[0xcd, 0x80]); // int 0x80
+    mov_r64_r64(&mut code, RDX, RAX); // bytes read -> rdx (len for write)
+
+    mov_imm64(&mut code, RAX, syscall::SYS_WRITE);
+    mov_imm64(&mut code, RDI, 1); // fd = stdout
+    let write_buf_patch_at = code.len() + 2;
+    mov_imm64(&mut code, RSI, 0); // buf_addr, patched in below
+    code.extend_from_slice(&[0xcd, 0x80]); // int 0x80
+
+    mov_imm64(&mut code, RAX, syscall::SYS_EXIT);
+    code.extend_from_slice(&[0xcd, 0x80]); // int 0x80, never returns
+
+    // The path string and scratch read buffer immediately follow the code
+    // — now that the code is fully assembled, their real addresses are
+    // known.
+    let path_addr = page_addr + code.len() as u64;
+    code[path_ptr_patch_at..path_ptr_patch_at + 8].copy_from_slice(&path_addr.to_le_bytes());
+    code.extend_from_slice(OPEN_READ_DEMO_PATH);
+
+    let buf_addr = page_addr + code.len() as u64;
+    code[read_buf_patch_at..read_buf_patch_at + 8].copy_from_slice(&buf_addr.to_le_bytes());
+    code[write_buf_patch_at..write_buf_patch_at + 8].copy_from_slice(&buf_addr.to_le_bytes());
+    code.resize(code.len() + OPEN_READ_DEMO_READ_LEN as usize, 0);
+
+    code
+}
+
+/// Build a fresh, isolated address space, map the open/read demo shellcode
+/// into it, and — if `run` — spawn a thread that drops into it. Same shape
+/// as `spawn_isolated_demo`, but proving a different, newer part of the
+/// syscall ABI (`syscall::SYS_OPEN`/`SYS_CLOSE`, and `SYS_READ` reading a
+/// real file instead of stdin) rather than the original read/write-from-
+/// stdin loop. Unlike that demo, this one is safe to leave permanently
+/// enabled (`run: true`, called that way from `main.rs`): it reads and
+/// prints its file exactly once and then exits for good — nothing about it
+/// loops or competes with the kernel's own keyboard task the way an
+/// stdin-echo demo left running forever would.
+pub fn spawn_open_read_demo(
+    kernel_mapper: &mut OffsetPageTable<'_>,
+    physical_memory_offset: VirtAddr,
+    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
+    run: bool,
+) {
+    let (l4_frame, mut isolated_mapper) =
+        unsafe { memory::new_address_space(physical_memory_offset, frame_allocator) };
+
+    let code = build_open_read_shellcode(OPEN_READ_DEMO_ADDR);
+    map_shellcode_page(
+        &mut isolated_mapper,
+        frame_allocator,
+        physical_memory_offset,
+        OPEN_READ_DEMO_ADDR,
+        &code,
+    );
+
+    if run {
+        scheduler::spawn_isolated(
+            run_open_read_demo,
+            l4_frame,
+            kernel_mapper,
+            &mut isolated_mapper,
+            frame_allocator,
+        );
+    }
+}
+
+/// Spawned via `spawn_open_read_demo`. Same shape as `run_isolated_demo` —
+/// it's the address space and the shellcode `spawn_open_read_demo` already
+/// set up (not this function) that make it what it is.
+pub fn run_open_read_demo() -> ! {
+    let entry = VirtAddr::new(OPEN_READ_DEMO_ADDR);
+    let stack_top = VirtAddr::new(OPEN_READ_DEMO_ADDR + 4096 - 16);
 
     unsafe {
         enter_ring3(entry, stack_top);
@@ -371,9 +529,9 @@ fn spawn_loaded_elf_demo(
         elf::load(elf_bytes, physical_memory_offset, frame_allocator);
 
     crate::println!(
-        "loaded a real ELF binary: entry={:?} stack_top={:?}",
-        loaded.entry,
-        loaded.stack_top
+        "[elf]   loaded OK — entry={:#x}, stack_top={:#x}",
+        loaded.entry.as_u64(),
+        loaded.stack_top.as_u64(),
     );
     ELF_DEMO_ENTRY.store(loaded.entry.as_u64(), Ordering::Relaxed);
     ELF_DEMO_STACK_TOP.store(loaded.stack_top.as_u64(), Ordering::Relaxed);

@@ -205,19 +205,18 @@ fn next_cluster(bpb: &BiosParameterBlock, cluster: u16) -> Option<u16> {
 
 /// Read the full contents of `name` (an 8.3 filename, case-insensitive —
 /// e.g. `"ECHO.ELF"`) from the root directory of the filesystem disk.
-/// Returns `None` if no such file exists, or if the secondary drive
-/// doesn't hold a FAT16 filesystem this driver recognizes at all (see
-/// `BiosParameterBlock::parse`) — deliberately not a hard failure, since
-/// that's the expected state on a dev machine that hasn't built `fs.img`
-/// yet (see `build.rs`).
-///
-/// # Panics
-/// If `name` isn't representable as an 8.3 name (longer than 8 characters
-/// before the dot, or more than 3 after it) — this driver has no long-
-/// filename support, so such a name could never have matched anything
-/// found on disk anyway.
+/// Returns `None` if no such file exists, if `name` isn't even
+/// representable as an 8.3 name (longer than 8 characters before the dot,
+/// or more than 3 after it — this driver has no long-filename support, so
+/// such a name could never have matched anything found on disk anyway), or
+/// if the secondary drive doesn't hold a FAT16 filesystem this driver
+/// recognizes at all (see `BiosParameterBlock::parse`) — deliberately not a
+/// hard failure for any of these: a bad name is exactly what a ring-3
+/// caller's own `syscall::SYS_OPEN` (src/syscall.rs) can hand this
+/// unvalidated, and an unbuilt `fs.img` is the expected state on a dev
+/// machine that hasn't run `build.rs`'s FAT-image step yet.
 pub fn read_file(name: &str) -> Option<Vec<u8>> {
-    let fat_name = to_fat_83(name).expect("fs: not a representable 8.3 filename");
+    let fat_name = to_fat_83(name)?;
 
     let boot_sector = read_sector(0);
     let bpb = BiosParameterBlock::parse(&boot_sector)?;

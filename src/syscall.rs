@@ -16,6 +16,8 @@ use x86_64::registers::control::Cr3;
 pub const SYS_WRITE: u64 = 0;
 pub const SYS_READ: u64 = 1;
 pub const SYS_EXIT: u64 = 2;
+pub const SYS_OPEN: u64 = 3;
+pub const SYS_CLOSE: u64 = 4;
 
 /// The IDT entry (src/interrupts.rs) points directly at this, via
 /// `Entry::set_handler_addr` rather than `set_handler_fn` — it can't be a
@@ -98,6 +100,8 @@ extern "C" fn dispatch(number: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
     match number {
         SYS_WRITE => sys_write(arg1, arg2, arg3),
         SYS_READ => sys_read(arg1, arg2, arg3),
+        SYS_OPEN => sys_open(arg1, arg2),
+        SYS_CLOSE => sys_close(arg1),
         // `scheduler::exit_current_thread()` returns `!`, not `u64` — it
         // never comes back here to produce a value, the same way it never
         // comes back to `entry`'s own `call {dispatch}` either (see that
@@ -141,27 +145,39 @@ fn sys_write(fd: u64, ptr: u64, len: u64) -> u64 {
     len as u64
 }
 
-/// read(fd, ptr, len) -> bytes read (possibly 0 if none are available
-/// right now — this never blocks), or u64::MAX on error. Only fd == 0
-/// (stdin, decoded keyboard input) is supported.
-///
-/// Unlike `sys_write`, this needs kernel-owned state: the queue of
-/// decoded keystrokes (`task::keyboard`), fed by the keyboard interrupt
-/// handler via the same async-task machinery `print_keypresses` uses.
-/// That queue lives on the kernel heap, which an isolated caller's own
-/// CR3 doesn't map — so, same reasoning as `keyboard_interrupt_handler`
-/// (src/interrupts.rs), the kernel's own address space has to be forced
-/// for that part. A stack-local buffer stages the result so the switch
-/// back to the caller's own CR3 happens *before* touching its buffer.
+/// read(fd, ptr, len) -> bytes read (possibly 0 if none are available right
+/// now, for stdin, or if an open file is exhausted — this never blocks), or
+/// u64::MAX on error. fd == 0 is stdin (decoded keyboard input); fd >=
+/// `scheduler::FIRST_FILE_FD` is a file this thread opened via `sys_open`.
+/// Every other fd (including 1, stdout — write-only) is an error.
 fn sys_read(fd: u64, ptr: u64, len: u64) -> u64 {
-    if fd != 0 || ptr == 0 {
-        return 0;
+    if ptr == 0 {
+        return u64::MAX;
     }
     let len = len.min(256) as usize;
     if len == 0 {
         return 0;
     }
 
+    if fd == 0 {
+        return sys_read_stdin(ptr, len);
+    }
+    if fd >= scheduler::FIRST_FILE_FD {
+        return sys_read_file(fd, ptr, len);
+    }
+    u64::MAX
+}
+
+/// The stdin case of `sys_read`, unchanged from before `sys_open`/file
+/// reads existed: kernel-owned state (the queue of decoded keystrokes,
+/// `task::keyboard`, fed by the keyboard interrupt handler via the same
+/// async-task machinery `print_keypresses` uses) lives on the kernel heap,
+/// which an isolated caller's own CR3 doesn't map — so, same reasoning as
+/// `keyboard_interrupt_handler` (src/interrupts.rs), the kernel's own
+/// address space has to be forced for that part. A stack-local buffer
+/// stages the result so the switch back to the caller's own CR3 happens
+/// *before* touching its buffer.
+fn sys_read_stdin(ptr: u64, len: usize) -> u64 {
     let mut staged = [0u8; 256];
     let read_count = {
         let (caller_page_table, flags) = Cr3::read();
@@ -194,4 +210,88 @@ fn sys_read(fd: u64, ptr: u64, len: u64) -> u64 {
         }
     }
     read_count as u64
+}
+
+/// The open-file case of `sys_read`: copy up to `len` bytes from the
+/// calling thread's own `fd` (`scheduler::read_open_file`, which handles
+/// the same CR3 juggling `sys_read_stdin` does above, since an open file's
+/// buffered bytes are heap-backed too) into its buffer at `ptr`.
+fn sys_read_file(fd: u64, ptr: u64, len: usize) -> u64 {
+    let mut staged = [0u8; 256];
+    match scheduler::read_open_file(fd, &mut staged[..len]) {
+        Some(count) => {
+            if count > 0 {
+                unsafe {
+                    core::ptr::copy_nonoverlapping(staged.as_ptr(), ptr as *mut u8, count);
+                }
+            }
+            count as u64
+        }
+        None => u64::MAX,
+    }
+}
+
+/// open(path_ptr, path_len) -> fd, or u64::MAX if the path isn't valid
+/// UTF-8, isn't representable as an 8.3 name, doesn't exist on the FAT16
+/// disk (`fs::read_file`), or the calling thread already has
+/// `scheduler::MAX_OPEN_FILES` other files open. Reads the *entire* file
+/// into a kernel-owned buffer immediately — `fs::read_file` has no
+/// partial/streaming read of its own — so later `read(fd, ...)` calls just
+/// copy out of that buffer.
+///
+/// `path_ptr`/`path_len` describe a buffer in the caller's own address
+/// space, trusted the same way `sys_write`'s `ptr`/`len` are (see its own
+/// doc comment) — capped at a small length rather than validated.
+fn sys_open(path_ptr: u64, path_len: u64) -> u64 {
+    if path_ptr == 0 || path_len == 0 || path_len > 255 {
+        return u64::MAX;
+    }
+    let path_len = path_len as usize;
+
+    // Copied onto the stack — mapped under every address space this kernel
+    // ever builds, unlike `path_ptr` itself, which points into the
+    // *caller's* own — before the CR3 switch below leaves that behind.
+    // `fs::read_file` needs both this path *and* the kernel heap (for the
+    // `Vec<u8>` it hands back), and those two requirements can't be
+    // satisfied under the same CR3 for an isolated caller, so the path has
+    // to be captured first, independent of whichever address space is
+    // active once `fs::read_file` actually runs.
+    let mut staged_path = [0u8; 255];
+    unsafe {
+        core::ptr::copy_nonoverlapping(path_ptr as *const u8, staged_path.as_mut_ptr(), path_len);
+    }
+    let path = match core::str::from_utf8(&staged_path[..path_len]) {
+        Ok(s) => s,
+        Err(_) => return u64::MAX,
+    };
+
+    // Same reasoning (and the same pattern) as `sys_read_stdin`'s own CR3
+    // handling: `fs::read_file` touches the kernel heap, which an isolated
+    // caller's own CR3 doesn't map.
+    let (caller_page_table, flags) = Cr3::read();
+    let kernel_page_table = scheduler::kernel_page_table();
+    let needs_switch = caller_page_table != kernel_page_table;
+    if needs_switch {
+        unsafe { Cr3::write(kernel_page_table, flags) };
+    }
+    let data = crate::fs::read_file(path);
+    if needs_switch {
+        unsafe { Cr3::write(caller_page_table, flags) };
+    }
+
+    match data {
+        Some(data) => scheduler::open_file(data).unwrap_or(u64::MAX),
+        None => u64::MAX,
+    }
+}
+
+/// close(fd) -> 0 on success, u64::MAX if `fd` wasn't a file the calling
+/// thread currently had open. Frees the file's buffered contents
+/// immediately (`scheduler::close_file`) rather than waiting for the
+/// thread to exit — purely a courtesy to a caller that wants to free up a
+/// slot in its own `scheduler::MAX_OPEN_FILES`-sized table without exiting;
+/// nothing about correctness depends on a program ever calling this, since
+/// `reap_zombie` frees every still-open file at exit regardless.
+fn sys_close(fd: u64) -> u64 {
+    if scheduler::close_file(fd) { 0 } else { u64::MAX }
 }
