@@ -19,6 +19,7 @@
 mod context;
 
 use crate::gdt;
+use crate::memory;
 use alloc::alloc::Layout;
 use spin::Mutex;
 use x86_64::{
@@ -406,17 +407,16 @@ pub fn yield_now() {
 /// ring 3 via the syscall ABI (`syscall::SYS_EXIT` — see src/syscall.rs);
 /// either way this is the only place that actually implements it.
 ///
-/// Deliberately doesn't (and, without a frame *deallocator* — this
-/// kernel's `BootInfoFrameAllocator` only ever hands frames out, never
-/// takes them back — structurally can't yet) free the physical frames
-/// backing an isolated thread's own address space (its L4 table, and
-/// whatever `elf::load`/`userspace::map_shellcode_page` mapped into it):
-/// those leak. Reclaiming the kernel stack is the part that's actually
-/// tractable today (it's ordinary heap memory, and this kernel's heap
-/// allocator supports freeing), and the part that matters most in
-/// practice — it's what makes the thread *table slot* reusable, which is
-/// what would otherwise make every process this kernel ever ran a
-/// one-way trip through `MAX_THREADS`.
+/// Also frees the physical frames backing an isolated thread's own address
+/// space — its L4 table, and whatever `elf::load`/
+/// `userspace::map_shellcode_page` mapped into it — via
+/// `memory::free_address_space`, once it's safe to (see `reap_zombie`).
+/// Reclaiming the kernel stack and thread-table slot is what matters most
+/// in practice — it's what makes the slot reusable at all, which is what
+/// would otherwise make every process this kernel ever ran a one-way trip
+/// through `MAX_THREADS` — but without also freeing an isolated thread's
+/// address space, every isolated process would instead be a one-way trip
+/// through physical memory itself.
 ///
 /// # Panics
 /// If called by the boot thread (id 0 — `kernel_main` never calls this,
@@ -483,11 +483,12 @@ pub fn exit_current_thread() -> ! {
 }
 
 /// If a previous call to `exit_current_thread()` left a thread's slot
-/// pending cleanup, free its kernel stack and clear the slot now. Safe to
-/// call unconditionally from here: reaching a scheduling decision at all
-/// means the *previous* zombie's own `switch_to` call already handed
-/// control away for good, so nothing is still executing on the stack this
-/// is about to deallocate.
+/// pending cleanup, free its kernel stack (and, if it was an isolated
+/// thread, its own address space) and clear the slot now. Safe to call
+/// unconditionally from here: reaching a scheduling decision at all means
+/// the *previous* zombie's own `switch_to` call already handed control away
+/// for good, so nothing is still executing on the stack (or under the
+/// address space) this is about to free.
 ///
 /// Runs as its own short lock scope, separate from `schedule()`'s and
 /// `exit_current_thread()`'s own — same reason `spawn()`'s allocation
@@ -495,16 +496,59 @@ pub fn exit_current_thread() -> ! {
 /// its own internal lock, and there's no reason to hold two at once
 /// longer than necessary.
 fn reap_zombie() {
-    let dead: Option<Thread> = interrupts::without_interrupts(|| {
+    let reaped: Option<(Thread, PhysFrame)> = interrupts::without_interrupts(|| {
         let mut guard = SCHEDULER.lock();
         let state = guard.as_mut().expect("scheduler not initialized");
         let zombie_id = state.zombie.take()?;
-        state.threads[zombie_id].take()
+        let dead = state.threads[zombie_id].take()?;
+        Some((dead, state.kernel_page_table))
     });
 
-    if let Some(thread) = dead {
-        let layout = Layout::from_size_align(thread.stack_size, 4096).unwrap();
-        unsafe { alloc::alloc::dealloc(thread.stack_base, layout) };
+    let Some((thread, kernel_page_table)) = reaped else {
+        return;
+    };
+
+    // Whichever thread was actually running when this function got called
+    // (not the zombie itself — it was already switched away from, in an
+    // earlier call) might have been an isolated one, meaning CR3 right now
+    // could be pointing at an address space that doesn't map the kernel
+    // heap at all (see `memory::new_address_space`) — and both the stack
+    // deallocation below and `memory::free_address_space` touch the heap
+    // (the allocator's own free list, and — for the latter — its internal
+    // `Vec`-backed frame free list too). Forcing CR3 back to the shared
+    // kernel address space first makes that safe unconditionally; it's a
+    // no-op (beyond a redundant TLB flush) whenever the running thread
+    // wasn't isolated to begin with. Sound because every thread's own
+    // kernel stack — this one included, whatever it's currently running on
+    // — is mapped identically under every address space this kernel ever
+    // builds (`scheduler::spawn_isolated` maps it in specifically so this
+    // kind of switch is always safe), so nothing about the code or stack
+    // still executing right here becomes unreachable.
+    unsafe { Cr3::write(kernel_page_table, Cr3::read().1) };
+
+    // Computed before the stack itself is freed below, purely as a range of
+    // *addresses* — nothing here dereferences it. Passed on to
+    // `memory::free_address_space` so it can recognize (and skip) the leaf
+    // frames of this exact range wherever they're also mapped into the
+    // thread's own isolated address space — see that function's doc comment
+    // on `borrowed_data_range` for why: they're the same physical frames
+    // `alloc::alloc::dealloc`, right below, is about to hand back to the
+    // heap allocator, not `frame_allocator`'s to reclaim a second time.
+    let stack_addr = thread.stack_base as u64;
+    let stack_range = stack_addr..stack_addr + thread.stack_size as u64;
+
+    let layout = Layout::from_size_align(thread.stack_size, 4096).unwrap();
+    unsafe { alloc::alloc::dealloc(thread.stack_base, layout) };
+
+    if let Some(page_table) = thread.page_table {
+        unsafe {
+            memory::free_address_space(
+                page_table,
+                memory::physical_memory_offset(),
+                stack_range,
+                &mut memory::GlobalFrameAllocator,
+            );
+        }
     }
 }
 

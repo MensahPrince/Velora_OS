@@ -38,7 +38,7 @@ The project exists to develop a rigorous, from-scratch understanding of the mech
 ### Process Loading and Lifecycle
 
 - `elf::load` parses the ELF64 file and program-header tables of a static, non-relocatable executable, maps its `PT_LOAD` segments into a freshly constructed isolated address space with permissions derived from `p_flags`, zero-fills the BSS region, and allocates a user-mode stack.
-- `scheduler::exit_current_thread` (reachable from kernel-mode thread bodies directly, or from ring 3 via `syscall::SYS_EXIT`) removes a thread from the round-robin rotation for good and frees its kernel stack, making its slot in the scheduler's fixed-size thread table available for reuse. A thread can't free the stack it's still executing on, so cleanup is deferred one scheduling event, to whichever *other* thread's own call into the scheduler runs next (`reap_zombie`), never to the exiting thread itself. Physical frames backing an isolated thread's own address space aren't yet reclaimed this way — see Known Limitations.
+- `scheduler::exit_current_thread` (reachable from kernel-mode thread bodies directly, or from ring 3 via `syscall::SYS_EXIT`) removes a thread from the round-robin rotation for good and frees its kernel stack, making its slot in the scheduler's fixed-size thread table available for reuse. A thread can't free the stack it's still executing on, so cleanup is deferred one scheduling event, to whichever *other* thread's own call into the scheduler runs next (`reap_zombie`), never to the exiting thread itself. If the exiting thread was isolated (`spawn_isolated`), `reap_zombie` also walks and frees its entire address space (`memory::free_address_space`) — every `PT_LOAD` segment, its user stack, and every intermediate page-table frame allocated to reach them — back to a global, reusable `BootInfoFrameAllocator` (`memory::GlobalFrameAllocator`), skipping only what that address space never owned in the first place: the kernel-shared L4 entries `new_address_space` cloned in, and the thread's own kernel-mode stack, which `spawn_isolated` deliberately dual-maps into it but which belongs to the ordinary heap allocator, not the frame allocator.
 
 ### Storage I/O and Filesystem
 
@@ -111,18 +111,17 @@ cargo test    # execute the integration test suite (headless)
 | ELF64 loading | Implemented (static `PT_LOAD` executables only) |
 | Disk I/O | Implemented (PIO sector reads, primary + secondary drive) |
 | Filesystem | Implemented (read-only FAT16: file lookup by 8.3 name, cluster-chain reads) |
-| Process lifecycle (spawn/exit) | Implemented (thread-table slot + kernel-stack reclamation on exit) |
+| Process lifecycle (spawn/exit) | Implemented (thread-table slot, kernel-stack, and — for isolated processes — full address-space reclamation on exit) |
 
 ## Known Limitations
 
 - **ELF loader constraints.** Only statically linked, non-PIE executables with page-aligned `PT_LOAD` segments are supported; there is no relocation processing, dynamic linking, or section-header parsing.
 - **Filesystem constraints.** `fs.rs` is read-only, FAT16-only (no FAT12/32), root-directory-only (no subdirectories), and 8.3-name-only (no long filenames) — enough to look up and read back a single flat file, not a general-purpose filesystem.
 - **No NX enforcement.** `EFER.NXE` is not enabled, so the page table's `NO_EXECUTE` bit is not currently meaningful.
-- **No physical-frame reclamation on exit.** `exit_current_thread` frees a thread's kernel stack (ordinary heap memory), but an isolated thread's own address space — its L4 table and everything mapped into it (e.g. a loaded ELF's segments) — leaks: `BootInfoFrameAllocator` only ever hands physical frames out, it has no way to take them back yet.
 
 ## Future Work
 
-In approximate dependency order: a real frame deallocator, so `exit_current_thread` can reclaim an isolated process's address space rather than just its kernel stack; `fork`/`exec`-equivalent primitives built on top of the now-working spawn/exit lifecycle; an expanded system-call surface (e.g. an `open`/`read`-by-path pair backed by `fs.rs`, rather than only the kernel's own boot-time demo calling it directly); and, further out, filesystem writes and subdirectory support.
+In approximate dependency order: `fork`/`exec`-equivalent primitives built on top of the now-working spawn/exit lifecycle (including full address-space reclamation); an expanded system-call surface (e.g. an `open`/`read`-by-path pair backed by `fs.rs`, rather than only the kernel's own boot-time demo calling it directly); and, further out, filesystem writes and subdirectory support.
 
 ## References
 

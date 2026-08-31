@@ -35,8 +35,9 @@ use velora_os::println;
 extern crate alloc;
 use alloc::{boxed::Box, vec, vec::Vec, rc::Rc};
 
-use velora_os::memory::BootInfoFrameAllocator;
 use x86_64::structures::paging::{FrameAllocator, OffsetPageTable, Page, Size4KiB};
+#[cfg(not(test))]
+use x86_64::structures::paging::{Mapper, PageTableFlags};
 
 entry_point!(kernel_main);
 fn kernel_main(boot_info: &'static BootInfo) -> ! {
@@ -72,7 +73,14 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     
 
     let mut mapper = unsafe { memory::init(phys_mem_offset) };
-    let mut frame_allocator = unsafe { BootInfoFrameAllocator::init(&boot_info.memory_map) };
+    // Global rather than a local variable (unlike `mapper` above): an
+    // isolated thread's address space, once it exits, is freed from
+    // `scheduler::reap_zombie` — nowhere near this stack frame — so the
+    // allocator it's freed back into has to be reachable from there too.
+    // See `memory::FRAME_ALLOCATOR`'s doc comment.
+    unsafe { memory::init_frame_allocator(&boot_info.memory_map) };
+    memory::set_physical_memory_offset(phys_mem_offset);
+    let mut frame_allocator = memory::GlobalFrameAllocator;
     // A handful of virtual addresses whose physical mappings we want to print.
     // This exercises the new mapper and confirms the paging setup is correct.
 
@@ -244,6 +252,59 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
         }
     }
 
+    // Process-lifecycle reclamation, extended to isolated (per-process)
+    // address spaces: like the loop above, but each of these 20 short-lived
+    // threads first gets its own address space (`memory::new_address_space`)
+    // with a few real pages mapped into it — spread across more than one L2
+    // table, so freeing it back (`memory::free_address_space`, called from
+    // `scheduler::reap_zombie`) actually has to walk more than one L1 table
+    // recursively, not just handle the trivial single-L4-frame case.
+    // `MAX_THREADS` doesn't gate this the way it gates the loop above (a
+    // leaked address space doesn't fill a thread-table slot), so this can't
+    // panic its way to proving reclamation happened the same way that one
+    // does — but it does prove `memory::free_address_space`'s recursive
+    // teardown never corrupts whichever *other* address space happens to be
+    // active when it runs: this loop keeps running to completion, and the
+    // kernel keeps working normally afterward.
+    #[cfg(not(test))]
+    for _ in 0..20u32 {
+        let (l4_frame, mut isolated_mapper) =
+            unsafe { memory::new_address_space(phys_mem_offset, &mut frame_allocator) };
+
+        // Three throwaway pages, deliberately 2 MiB apart (spanning more
+        // than one L2 table) rather than all in the same one.
+        for page_addr in [0x5000_0000_0000u64, 0x5000_0000_1000, 0x5000_0020_0000] {
+            let page = Page::<Size4KiB>::containing_address(VirtAddr::new(page_addr));
+            let frame = frame_allocator
+                .allocate_frame()
+                .expect("no physical frames left for isolated-address-space reclaim demo");
+            unsafe {
+                isolated_mapper
+                    .map_to(
+                        page,
+                        frame,
+                        PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
+                        &mut frame_allocator,
+                    )
+                    .expect("failed to map isolated-address-space reclaim demo page")
+                    .flush();
+            }
+        }
+
+        velora_os::scheduler::spawn_isolated(
+            isolated_exit_demo_thread,
+            l4_frame,
+            &mut mapper,
+            &mut isolated_mapper,
+            &mut frame_allocator,
+        );
+        velora_os::scheduler::yield_now();
+    }
+    println!(
+        "scheduler: spawned and exited 20 isolated (per-process) threads, each freed back \
+         through memory::free_address_space — kernel still healthy afterward"
+    );
+
     // Commented out while focusing on paging — re-enable to run the test suite.
     #[cfg(test)]
     test_main();
@@ -344,6 +405,17 @@ fn exit_demo_thread() -> ! {
     velora_os::scheduler::exit_current_thread();
 }
 
+/// Spawned (via `scheduler::spawn_isolated`, not `spawn`) by the isolated-
+/// address-space reclamation demo in `kernel_main` — see its comment there.
+/// Runs entirely in ring 0 under its own address space (never drops to ring
+/// 3 the way the userspace demos do — there's nothing at its entry point
+/// worth executing, this exists purely to exit and trigger
+/// `memory::free_address_space`), then exits for good.
+#[cfg(not(test))]
+fn isolated_exit_demo_thread() -> ! {
+    velora_os::scheduler::exit_current_thread();
+}
+
 /// Gives up its turn voluntarily every iteration, exercising the
 /// yield_now() path rather than relying only on the timer.
 #[cfg(not(test))]
@@ -370,6 +442,7 @@ fn demo_thread_b() -> ! {
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     println!("{}", info);
+    velora_os::serial_println!("PANIC: {}", info);
     // Disable interrupts so the timer/keyboard handlers can't keep printing
     // and scroll the panic message off screen while we're halted.
     x86_64::instructions::interrupts::disable();
