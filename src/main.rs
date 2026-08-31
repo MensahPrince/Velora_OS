@@ -352,12 +352,42 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     }
     println!("[sched] 20 isolated address spaces spawned/exited and fully reclaimed OK");
 
+    // The interactive shell (disk/shell.s -> SHELL.ELF): reads a program
+    // name from the keyboard and spawns it (`syscall::SYS_SPAWN`), waiting
+    // for it to finish (`SYS_WAIT`) before prompting again — the first
+    // thing in this kernel that turns typed input into a *launched
+    // program*, rather than just an echo test or one fixed, hardcoded
+    // command the way every demo above is. `spawn_disk_elf_demo` is
+    // reused as-is here (it's already exactly "load these ELF bytes and
+    // run them" with nothing echo-specific about it) — this call is the
+    // real thing, not a demo, and unlike every demo above it's left
+    // running forever, never waited on: this *is* the interactive end
+    // state now, not `print_keypresses`'s own loop below, which keeps
+    // running underneath it purely to feed the keyboard queue `SYS_READ`
+    // pulls from and echo what's typed to the screen (see disk/shell.s's
+    // own comment for why the shell doesn't also echo).
+    #[cfg(not(test))]
+    {
+        match velora_os::fs::read_file("SHELL.ELF") {
+            Some(elf_bytes) => {
+                velora_os::userspace::spawn_disk_elf_demo(
+                    &elf_bytes,
+                    &mut mapper,
+                    phys_mem_offset,
+                    &mut frame_allocator,
+                    true,
+                );
+            }
+            None => println!("[fs]    SHELL.ELF not found (was fs.img built? see build.rs)"),
+        }
+    }
+
     // Commented out while focusing on paging — re-enable to run the test suite.
     #[cfg(test)]
     test_main();
 
     println!();
-    println!("Velora OS ready — type to test the keyboard echo.");
+    println!("Velora OS ready — the shell is running below. Type a program name (e.g. GREET.ELF) and press Enter.");
 
     // Hand off to the cooperative-multitasking executor. It never returns:
     // it polls ready tasks and `hlt`s the CPU whenever there's nothing to

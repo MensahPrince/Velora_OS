@@ -46,7 +46,7 @@ The project exists to develop a rigorous, from-scratch understanding of the mech
 
 - `ata::read_sector` implements polling-mode Programmed I/O against the legacy primary ATA interface (I/O ports `0x1F0`-`0x1F7`), sufficient to read arbitrary LBA28 sectors from either drive on that bus (`ata::Drive::Primary`/`Secondary`, selected via the drive-select bit — no second bus's worth of ports needed).
 - `fs::read_file` implements a minimal, read-only FAT16 driver: BIOS Parameter Block parsing, root-directory 8.3-name lookup, and cluster-chain following, sufficient to read a whole file back from the secondary drive. That drive carries a filesystem entirely independent of the boot disk (`ata::Drive::Primary`, whose sector 0 is still just the bootloader), built by real host tooling (`mkfs.fat`, `mtools`) rather than by this kernel itself — see `build.rs`.
-- `build.rs` assembles a small real userspace program (`disk/echo.s`, linked via `disk/link.ld` into a static, non-PIE ELF64 executable using the host's own `as`/`ld`) and copies it onto a freshly formatted FAT16 image (`fs.img`) as `ECHO.ELF`, attached to QEMU as the secondary drive. `main.rs` reads it back through `fs::read_file` and the real ELF loader (`elf::load`) at boot — the same read/write ring-3 echo demo the other loader demo runs, but arrived at via an actual on-disk file rather than one embedded in the kernel image.
+- `build.rs` assembles every real userspace program under `disk/` (each, e.g. `disk/echo.s`, linked via the shared `disk/link.ld` into a static, non-PIE ELF64 executable using the host's own `as`/`ld`) and copies them onto a freshly formatted FAT16 image (`fs.img`) as `ECHO.ELF`, `GREET.ELF`, and `SHELL.ELF`, attached to QEMU as the secondary drive. `SHELL.ELF` is what `main.rs` actually runs at boot now (via `fs::read_file` and the real ELF loader, `elf::load`): a real interactive shell — prompt, read a line, `syscall::SYS_SPAWN` whatever program it names, `SYS_WAIT` for it to finish, prompt again — the first thing in this kernel that turns typed input into a *launched program* rather than a fixed, hardcoded demo. `GREET.ELF` exists purely as something for the shell (or another program, via `SYS_SPAWN`) to launch that actually exits; `ECHO.ELF`'s own read/write echo loop never does, so it stays useful only as something to launch by hand and watch, the same way it always was.
 
 ## Project Structure
 
@@ -68,10 +68,12 @@ velora_os/
 │   ├── fs.rs              Read-only FAT16 filesystem driver
 │   ├── vga_buffer.rs      VGA text-mode output driver
 │   └── serial.rs          UART 16550 serial output driver
-├── disk/                  Source for the on-disk test program (see build.rs)
-│   ├── echo.s              Freestanding x86-64 ring-3 test program
-│   └── link.ld              Linker script forcing a single page-aligned PT_LOAD
-├── build.rs               Assembles disk/echo.s and builds fs.img (FAT16 image)
+├── disk/                  Source for the on-disk programs (see build.rs)
+│   ├── shell.s              The real interactive shell (prompt, read a line, spawn/wait)
+│   ├── echo.s                Freestanding x86-64 ring-3 read/write echo loop
+│   ├── greet.s                 Prints a banner and exits — something to spawn and wait on
+│   └── link.ld                  Linker script forcing a single page-aligned PT_LOAD
+├── build.rs               Assembles every disk/*.s program and builds fs.img (FAT16 image)
 ├── tests/                 Integration tests (executed inside QEMU)
 ├── x86_64-velora_os.json  Custom bare-metal target specification
 └── .cargo/config.toml     Build configuration (target, build-std, QEMU runner)
@@ -114,6 +116,7 @@ cargo test    # execute the integration test suite (headless)
 | Disk I/O | Implemented (PIO sector reads, primary + secondary drive) |
 | Filesystem | Implemented (read-only FAT16: file lookup by 8.3 name, cluster-chain reads) |
 | Process lifecycle (spawn/exit) | Implemented (thread-table slot, kernel-stack, and — for isolated processes — full address-space reclamation on exit) |
+| Interactive shell | Implemented (`disk/shell.s` — reads a program name from the keyboard, `spawn`s and `wait`s on it, then prompts again) |
 
 ## Known Limitations
 
@@ -123,7 +126,7 @@ cargo test    # execute the integration test suite (headless)
 
 ## Future Work
 
-In approximate dependency order: a real interactive shell built on top of `syscall::SYS_SPAWN`/`SYS_WAIT` (a program that reads a command line and launches it, rather than every ring-3 program still being one of a fixed handful of boot-time demos); true `fork()` (copy-on-write address-space duplication — `SYS_SPAWN` deliberately doesn't attempt this, see its own doc comment); killing just the offending process, rather than only ending its current syscall, on other classes of fault beyond a bad syscall pointer; and, further out, filesystem writes and subdirectory support.
+In approximate dependency order: command-line arguments (`SYS_SPAWN` only takes a bare path today — the shell can launch a program, but can't pass it anything); true `fork()` (copy-on-write address-space duplication — `SYS_SPAWN` deliberately doesn't attempt this, see its own doc comment); killing just the offending process, rather than only ending its current syscall, on other classes of fault beyond a bad syscall pointer; and, further out, filesystem writes and subdirectory support.
 
 ## References
 

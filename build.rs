@@ -1,15 +1,15 @@
 // ============================================================
 // build.rs
 // Builds the second virtual disk (`fs.img`) that src/fs.rs's FAT16 driver
-// reads from: assembles and links disk/echo.s and disk/greet.s into real,
-// freestanding ELF64 executables with the host toolchain (`as`/`ld` —
-// cross-compiling *for the host*, not this kernel's own custom target,
-// since this code never runs inside the kernel itself), then packs them
-// onto a freshly formatted FAT16 image using `mkfs.fat` and `mtools` —
-// real, independent tools building the filesystem's on-disk bytes, the
-// same "check against something that isn't this kernel's own code"
-// reasoning src/ata.rs's own top-of-file comment already lays out for the
-// boot disk itself.
+// reads from: assembles and links every program in disk/ (see
+// DISK_PROGRAMS below) into real, freestanding ELF64 executables with the
+// host toolchain (`as`/`ld` — cross-compiling *for the host*, not this
+// kernel's own custom target, since this code never runs inside the
+// kernel itself), then packs them onto a freshly formatted FAT16 image
+// using `mkfs.fat` and `mtools` — real, independent tools building the
+// filesystem's on-disk bytes, the same "check against something that
+// isn't this kernel's own code" reasoning src/ata.rs's own top-of-file
+// comment already lays out for the boot disk itself.
 //
 // `fs.img` is written straight into the crate root (not `OUT_DIR`)
 // because `Cargo.toml`'s `[package.metadata.bootimage] run-args` needs a
@@ -41,12 +41,21 @@ use std::process::Command;
 /// test binary onto it is effectively instant on every build.
 const FS_IMAGE_SIZE_BYTES: u64 = 16 * 1024 * 1024;
 
+/// Every disk-resident assembly program this kernel ships, as (source file
+/// stem, 8.3 name to give it on `fs.img`) — all built the same way (`as`,
+/// then `ld` against the shared `disk/link.ld`), just for different actual
+/// programs, so `build_fs_image` just loops over this rather than
+/// hand-duplicating the same six lines once per program.
+const DISK_PROGRAMS: &[(&str, &str)] = &[
+    ("echo", "ECHO.ELF"),
+    ("greet", "GREET.ELF"),
+    ("shell", "SHELL.ELF"),
+];
+
 fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
 
-    let asm_src = manifest_dir.join("disk/echo.s");
-    let greet_asm_src = manifest_dir.join("disk/greet.s");
     let link_script = manifest_dir.join("disk/link.ld");
     let fs_image = manifest_dir.join("fs.img");
 
@@ -57,16 +66,20 @@ fn main() {
     // every single build and rerun this script (and recompile the kernel
     // crate right along with it) forever, on every build, even when
     // nothing real changed. The tradeoff: if `fs.img` is ever deleted by
-    // hand without touching `disk/echo.s`, it won't come back on its own
-    // until something else invalidates the build (e.g. `touch
-    // disk/echo.s`, or a clean build) — an acceptable gap for a file nothing
-    // but this script is expected to ever remove.
-    println!("cargo:rerun-if-changed={}", asm_src.display());
-    println!("cargo:rerun-if-changed={}", greet_asm_src.display());
+    // hand without touching a `disk/*.s` source, it won't come back on its
+    // own until something else invalidates the build (e.g. `touch
+    // disk/echo.s`, or a clean build) — an acceptable gap for a file
+    // nothing but this script is expected to ever remove.
+    for (stem, _) in DISK_PROGRAMS {
+        println!(
+            "cargo:rerun-if-changed={}",
+            manifest_dir.join("disk").join(format!("{stem}.s")).display()
+        );
+    }
     println!("cargo:rerun-if-changed={}", link_script.display());
     println!("cargo:rerun-if-changed=build.rs");
 
-    if let Err(reason) = build_fs_image(&asm_src, &greet_asm_src, &link_script, &out_dir, &fs_image) {
+    if let Err(reason) = build_fs_image(&manifest_dir, &link_script, &out_dir, &fs_image) {
         println!(
             "cargo:warning=fs.img: skipping FAT16 disk image build ({reason}); \
              writing a blank placeholder instead. Install `as`/`ld` (binutils) \
@@ -78,8 +91,7 @@ fn main() {
 }
 
 fn build_fs_image(
-    asm_src: &Path,
-    greet_asm_src: &Path,
+    manifest_dir: &Path,
     link_script: &Path,
     out_dir: &Path,
     fs_image: &Path,
@@ -88,48 +100,31 @@ fn build_fs_image(
         which(tool).ok_or_else(|| format!("`{tool}` not found on PATH"))?;
     }
 
-    let object = out_dir.join("echo.o");
-    let elf = out_dir.join("echo.elf");
-
-    run(Command::new("as").args(["--64", "-o"]).arg(&object).arg(asm_src))?;
-    run(Command::new("ld")
-        .args(["-static", "-nostdlib", "-T"])
-        .arg(link_script)
-        .arg("-o")
-        .arg(&elf)
-        .arg(&object))?;
-
-    // Same toolchain, same linker script (it just forces one page-aligned
-    // PT_LOAD segment at a fixed address regardless of content — nothing
-    // about it is specific to echo.s) — assembled and linked separately
-    // since the two are unrelated programs, not variants of one another.
-    let greet_object = out_dir.join("greet.o");
-    let greet_elf = out_dir.join("greet.elf");
-
-    run(Command::new("as").args(["--64", "-o"]).arg(&greet_object).arg(greet_asm_src))?;
-    run(Command::new("ld")
-        .args(["-static", "-nostdlib", "-T"])
-        .arg(link_script)
-        .arg("-o")
-        .arg(&greet_elf)
-        .arg(&greet_object))?;
-
     write_placeholder_image(fs_image);
     run(Command::new("mkfs.fat")
         .args(["-F", "16", "-n", "VELORAFS"])
         .arg(fs_image))?;
-    run(Command::new("mcopy")
-        .arg("-i")
-        .arg(fs_image)
-        .arg(&elf)
-        .arg("::ECHO.ELF"))?;
-    run(Command::new("mcopy")
-        .arg("-i")
-        .arg(fs_image)
-        .arg(&greet_elf)
-        .arg("::GREET.ELF"))?;
 
-    // A second, plain-text file — for `userspace::spawn_open_read_demo`
+    for (stem, fat_name) in DISK_PROGRAMS {
+        let asm_src = manifest_dir.join("disk").join(format!("{stem}.s"));
+        let object = out_dir.join(format!("{stem}.o"));
+        let elf = out_dir.join(format!("{stem}.elf"));
+
+        run(Command::new("as").args(["--64", "-o"]).arg(&object).arg(&asm_src))?;
+        run(Command::new("ld")
+            .args(["-static", "-nostdlib", "-T"])
+            .arg(link_script)
+            .arg("-o")
+            .arg(&elf)
+            .arg(&object))?;
+        run(Command::new("mcopy")
+            .arg("-i")
+            .arg(fs_image)
+            .arg(&elf)
+            .arg(format!("::{fat_name}")))?;
+    }
+
+    // A plain-text file — for `userspace::spawn_open_read_demo`
     // (src/userspace.rs) to open and read back through a real ring-3
     // syscall::SYS_OPEN/SYS_READ round trip and print, proving that path
     // end to end with genuinely printable output. ECHO.ELF itself would
