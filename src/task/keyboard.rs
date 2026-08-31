@@ -24,7 +24,7 @@ use futures_util::{
     stream::{Stream, StreamExt},
     task::AtomicWaker,
 };
-use pc_keyboard::{DecodedKey, HandleControl, Keyboard, ScancodeSet1, layouts};
+use pc_keyboard::{DecodedKey, HandleControl, KeyCode, Keyboard, ScancodeSet1, layouts};
 
 /// Scancodes queued up by the interrupt handler, waiting to be decoded by
 /// `print_keypresses`. Bounded so a burst of keystrokes can't grow memory
@@ -180,9 +180,78 @@ pub async fn print_keypresses() {
                             push_input_byte(character as u8);
                         }
                     }
-                    DecodedKey::RawKey(key) => print!("{:?}", key),
+                    // `Keyboard::process_keyevent` (pc_keyboard) reports a
+                    // `RawKey` event on every Shift/Ctrl/CapsLock/NumLock/
+                    // AltGr *press* purely so it can update its internal
+                    // `Modifiers` state — that state already lands in the
+                    // *next* key's decoded case/symbol (see
+                    // `Modifiers::is_shifted`/`is_caps`), so these carry no
+                    // printable content of their own. Left unfiltered,
+                    // holding Shift to type a capital letter would print
+                    // e.g. "LShiftH" instead of "H". Genuinely raw keys
+                    // with no other representation (arrows, function keys)
+                    // still print their debug form below.
+                    DecodedKey::RawKey(
+                        KeyCode::LShift
+                        | KeyCode::RShift
+                        | KeyCode::LControl
+                        | KeyCode::RControl
+                        | KeyCode::CapsLock
+                        | KeyCode::NumpadLock
+                        | KeyCode::RAltGr
+                        | KeyCode::RControl2,
+                    ) => {}
+                    // Arrows, Home/End/PageUp/PageDown/Insert, and the
+                    // function keys have no `char` representation — pc_keyboard
+                    // hands them back as a bare `KeyCode` rather than
+                    // guessing at one. A real terminal doesn't invent a
+                    // glyph for these either: it forwards the classic
+                    // ANSI/VT220 byte sequence a reading program (a line
+                    // editor with history, say) can recognize, and draws
+                    // nothing itself. `ansi_escape_sequence` below is that
+                    // same table; unmapped keys (Alt, Win, media keys, ...)
+                    // are silently dropped rather than debug-printed, same
+                    // reasoning as the modifier-key arm above.
+                    DecodedKey::RawKey(key) => {
+                        if let Some(sequence) = ansi_escape_sequence(key) {
+                            for &byte in sequence {
+                                push_input_byte(byte);
+                            }
+                        }
+                    }
                 }
             }
         }
+    }
+}
+
+/// The classic ANSI/VT220 `ESC [ ... ` byte sequence a terminal sends for a
+/// non-character key, for keys `sys_read` callers might reasonably want to
+/// react to. `None` for anything without a widely-recognized sequence (Alt,
+/// Win, media keys, ...) — those are dropped rather than guessed at.
+fn ansi_escape_sequence(key: KeyCode) -> Option<&'static [u8]> {
+    match key {
+        KeyCode::ArrowUp => Some(b"\x1b[A"),
+        KeyCode::ArrowDown => Some(b"\x1b[B"),
+        KeyCode::ArrowRight => Some(b"\x1b[C"),
+        KeyCode::ArrowLeft => Some(b"\x1b[D"),
+        KeyCode::Home => Some(b"\x1b[1~"),
+        KeyCode::Insert => Some(b"\x1b[2~"),
+        KeyCode::End => Some(b"\x1b[4~"),
+        KeyCode::PageUp => Some(b"\x1b[5~"),
+        KeyCode::PageDown => Some(b"\x1b[6~"),
+        KeyCode::F1 => Some(b"\x1b[11~"),
+        KeyCode::F2 => Some(b"\x1b[12~"),
+        KeyCode::F3 => Some(b"\x1b[13~"),
+        KeyCode::F4 => Some(b"\x1b[14~"),
+        KeyCode::F5 => Some(b"\x1b[15~"),
+        KeyCode::F6 => Some(b"\x1b[17~"),
+        KeyCode::F7 => Some(b"\x1b[18~"),
+        KeyCode::F8 => Some(b"\x1b[19~"),
+        KeyCode::F9 => Some(b"\x1b[20~"),
+        KeyCode::F10 => Some(b"\x1b[21~"),
+        KeyCode::F11 => Some(b"\x1b[23~"),
+        KeyCode::F12 => Some(b"\x1b[24~"),
+        _ => None,
     }
 }
