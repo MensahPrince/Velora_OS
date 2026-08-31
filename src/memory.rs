@@ -35,6 +35,34 @@ pub unsafe fn init(physical_memory_offset: VirtAddr) -> OffsetPageTable<'static>
         OffsetPageTable::new(level_4_table, physical_memory_offset)
     }
 }
+
+/// Build a fresh `OffsetPageTable` view over the *currently active* L4
+/// table, for a caller that doesn't already have its own long-lived mapper
+/// on hand the way `kernel_main` does — `syscall::sys_spawn` is the one so
+/// far: a syscall handler has no mapper of its own to reach for, just
+/// whatever's active when it runs. Unlike `init`, which documents itself
+/// as call-once, this is meant to be called any number of times: each call
+/// just re-derives a view over whatever's active right now, the same way
+/// `new_address_space` already does internally for its own "copy the
+/// active table's shared entries" step.
+///
+/// # Safety
+/// Same requirement as `init`: `physical_memory_offset` must be the value
+/// the bootloader actually mapped physical memory at, and must be
+/// currently active. Additionally — unlike `init` — the caller must accept
+/// that this aliases whatever *other* mapper (e.g. `kernel_main`'s own
+/// `mapper`, alive for that function's entire, unending lifetime) is also
+/// live over the same active table; an accepted, pre-existing shortcut
+/// this kernel already takes elsewhere (`new_address_space`'s own
+/// re-derivation of the active table has the identical aliasing shape),
+/// sound in practice only because nothing here holds onto the result
+/// longer than one syscall's worth of straight-line code.
+pub unsafe fn current_mapper(physical_memory_offset: VirtAddr) -> OffsetPageTable<'static> {
+    unsafe {
+        let level_4_table = active_level_4_table(physical_memory_offset);
+        OffsetPageTable::new(level_4_table, physical_memory_offset)
+    }
+}
 // active_level_4_table is intentionally private — callers should go through
 // `init()` and use the `OffsetPageTable` interface instead of holding a raw
 // mutable reference to the L4 table.

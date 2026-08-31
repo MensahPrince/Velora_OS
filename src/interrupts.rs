@@ -73,9 +73,15 @@ extern "x86-interrupt" fn breakpoint_handler(stack_frame: InterruptStackFrame) {
 
 extern "x86-interrupt" fn double_fault_handler(
     stack_frame: InterruptStackFrame,
-    _error_code: u64,
+    error_code: u64,
 ) -> ! {
-    panic!("EXCEPTION: DOUBLE FAULT\n{:#?}", stack_frame);
+    use x86_64::registers::control::Cr2;
+    panic!(
+        "EXCEPTION: DOUBLE FAULT\nerror_code={:#x}\nCR2={:?}\n{:#?}",
+        error_code,
+        Cr2::read(),
+        stack_frame
+    );
 }
 
 // Without this, any page fault (a bad pointer, a missing mapping — exactly

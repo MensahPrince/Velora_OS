@@ -236,7 +236,8 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     #[cfg(not(test))]
     {
         println!("[fs]    HELLO.TXT via ring-3 sys_open/sys_read/sys_write:");
-        velora_os::userspace::spawn_open_read_demo(&mut mapper, phys_mem_offset, &mut frame_allocator, true);
+        let pid = velora_os::userspace::spawn_open_read_demo(&mut mapper, phys_mem_offset, &mut frame_allocator, true);
+        wait_for_demo(pid);
     }
 
     // Validated syscall arguments (`syscall::copy_from_user`/
@@ -245,12 +246,37 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     // page-fault straight into a kernel panic — one misbehaving process
     // taking the whole kernel down with it. This ring-3 demo deliberately
     // calls `write(1, 0xdeadbeef, 10)` (src/userspace.rs's
-    // `build_bad_pointer_shellcode`) and checks that the syscall rejects
-    // it cleanly instead. `run: true` permanently, same reasoning as the
-    // open/read demo above: it runs once and exits for good.
+    // `build_bad_pointer_shellcode`); `copy_from_user` kills the calling
+    // thread outright rather than handing back an error, so watch for the
+    // "[proc]  thread killed: ..." line just below and the rest of boot
+    // continuing right on afterward — that's the proof, the same way the
+    // reclamation demos prove themselves by not taking the kernel down.
+    // `run: true` permanently, same reasoning as the open/read demo above:
+    // whether it exits or gets killed, this thread is gone for good either
+    // way after its one and only syscall.
     #[cfg(not(test))]
     {
-        velora_os::userspace::spawn_bad_pointer_demo(&mut mapper, phys_mem_offset, &mut frame_allocator, true);
+        let pid = velora_os::userspace::spawn_bad_pointer_demo(&mut mapper, phys_mem_offset, &mut frame_allocator, true);
+        wait_for_demo(pid);
+    }
+
+    // A running program launching another one (`syscall::SYS_SPAWN`/
+    // `SYS_WAIT`, src/syscall.rs): the piece a real interactive shell
+    // needs that nothing above provides — every process up to this point
+    // was spawned directly by this very kernel boot code
+    // (`elf::load`/`scheduler::spawn_isolated`), never by another running
+    // program. This ring-3 demo spawns `GREET.ELF` (src/userspace.rs's
+    // `build_spawn_wait_shellcode`), waits for it to exit, then prints its
+    // own confirmation — watch for `GREET.ELF`'s own banner followed by
+    // "spawn/wait demo: child finished, parent resumed". Not real
+    // `fork()` — see `syscall::sys_spawn`'s own doc comment for why that's
+    // deliberate. `run: true` permanently, same reasoning as the other
+    // syscall demos above: it (and the child it spawns) each run exactly
+    // once and exit for good.
+    #[cfg(not(test))]
+    {
+        let pid = velora_os::userspace::spawn_spawn_wait_demo(&mut mapper, phys_mem_offset, &mut frame_allocator, true);
+        wait_for_demo(pid);
     }
 
     // Process lifecycle (src/scheduler.rs's exit_current_thread, reached
@@ -402,6 +428,26 @@ fn run_bringup_demo(
         refcount_before_drop,
         refcount_after_drop,
     );
+}
+
+/// Block until the ring-3 syscall demo `pid` refers to (`None` if it
+/// wasn't actually spawned — nothing to wait for) has exited, before
+/// `kernel_main` moves on to the next one, the same way a real shell would
+/// wait for one command to finish before reading the next rather than
+/// leaving every command it ever ran going at once. These demos used to
+/// all just run concurrently, left to interleave with whatever
+/// `kernel_main` did next — not what actually caused the kernel-stack
+/// overflow chasing this down turned up (see `scheduler::STACK_SIZE`'s own
+/// doc comment for the real cause and fix), but unbounded concurrent
+/// growth in how many boot-time demo threads are alive at once was never
+/// really intentional either, and serializing them here costs nothing.
+#[cfg(not(test))]
+fn wait_for_demo(pid: Option<velora_os::scheduler::Pid>) {
+    if let Some(pid) = pid {
+        while velora_os::scheduler::thread_alive(pid) {
+            velora_os::scheduler::yield_now();
+        }
+    }
 }
 
 // ------------------------------------------------------------------

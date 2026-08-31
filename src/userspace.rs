@@ -26,7 +26,9 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use x86_64::{
     VirtAddr,
     instructions::segmentation::{DS, ES, FS, GS, Segment},
-    structures::paging::{FrameAllocator, Mapper, OffsetPageTable, Page, PageTableFlags, Size4KiB},
+    structures::paging::{
+        FrameAllocator, FrameDeallocator, Mapper, OffsetPageTable, Page, PageTableFlags, Size4KiB,
+    },
 };
 
 /// Where the demo's code+stack page lives. Arbitrary but deliberately far
@@ -95,16 +97,6 @@ fn mov_r64_r64(code: &mut Vec<u8>, dst: u8, src: u8) {
     code.push(0x48); // REX.W
     code.push(0x89);
     code.push(0xC0 | (src << 3) | dst);
-}
-
-/// `cmp r/m64, imm8` (opcode `83 /7`, sign-extending `imm8` to 64 bits) —
-/// compares `reg` against `imm8` (as a signed value; pass `0xFF` for `-1`,
-/// i.e. `u64::MAX`, the way `build_bad_pointer_shellcode` does).
-fn cmp_r64_imm8(code: &mut Vec<u8>, reg_opcode: u8, imm8: u8) {
-    code.push(0x48); // REX.W
-    code.push(0x83);
-    code.push(0xF8 | reg_opcode); // ModRM: mod=11, reg=111 (/7, CMP), rm=reg_opcode
-    code.push(imm8);
 }
 
 // Register encodings shared by every shellcode builder below (the plain
@@ -372,21 +364,24 @@ fn build_open_read_shellcode(page_addr: u64) -> Vec<u8> {
 }
 
 /// Build a fresh, isolated address space, map the open/read demo shellcode
-/// into it, and — if `run` — spawn a thread that drops into it. Same shape
-/// as `spawn_isolated_demo`, but proving a different, newer part of the
-/// syscall ABI (`syscall::SYS_OPEN`/`SYS_CLOSE`, and `SYS_READ` reading a
-/// real file instead of stdin) rather than the original read/write-from-
-/// stdin loop. Unlike that demo, this one is safe to leave permanently
-/// enabled (`run: true`, called that way from `main.rs`): it reads and
-/// prints its file exactly once and then exits for good — nothing about it
-/// loops or competes with the kernel's own keyboard task the way an
-/// stdin-echo demo left running forever would.
+/// into it, and — if `run` — spawn a thread that drops into it, returning
+/// its `Pid` (or `None` if `run` was false — nothing spawned, nothing to
+/// wait on). Same shape as `spawn_isolated_demo`, but proving a different,
+/// newer part of the syscall ABI (`syscall::SYS_OPEN`/`SYS_CLOSE`, and
+/// `SYS_READ` reading a real file instead of stdin) rather than the
+/// original read/write-from-stdin loop. Unlike that demo, this one is safe
+/// to leave permanently enabled (`run: true`, called that way from
+/// `main.rs`, which also waits on the returned `Pid` before moving on to
+/// the next demo — see its own comment for why): it reads and prints its
+/// file exactly once and then exits for good — nothing about it loops or
+/// competes with the kernel's own keyboard task the way an stdin-echo demo
+/// left running forever would.
 pub fn spawn_open_read_demo(
     kernel_mapper: &mut OffsetPageTable<'_>,
     physical_memory_offset: VirtAddr,
     frame_allocator: &mut impl FrameAllocator<Size4KiB>,
     run: bool,
-) {
+) -> Option<scheduler::Pid> {
     let (l4_frame, mut isolated_mapper) =
         unsafe { memory::new_address_space(physical_memory_offset, frame_allocator) };
 
@@ -399,15 +394,15 @@ pub fn spawn_open_read_demo(
         &code,
     );
 
-    if run {
+    run.then(|| {
         scheduler::spawn_isolated(
             run_open_read_demo,
             l4_frame,
             kernel_mapper,
             &mut isolated_mapper,
             frame_allocator,
-        );
-    }
+        )
+    })
 }
 
 /// Spawned via `spawn_open_read_demo`. Same shape as `run_isolated_demo` —
@@ -431,9 +426,6 @@ const BAD_POINTER_DEMO_ADDR: u64 = 0x7A00_0000_0000;
 /// `sys_write` as if it were a real buffer.
 const BAD_POINTER: u64 = 0xdead_beef;
 
-const BAD_POINTER_REJECTED_MSG: &[u8] = b"bad pointer correctly rejected by copy_from_user\n";
-const BAD_POINTER_NOT_REJECTED_MSG: &[u8] = b"BUG: bad pointer was not rejected!\n";
-
 /// Builds:
 ///
 /// ```text
@@ -441,102 +433,50 @@ const BAD_POINTER_NOT_REJECTED_MSG: &[u8] = b"BUG: bad pointer was not rejected!
 ///     mov rdi, 1
 ///     mov rsi, BAD_POINTER      ; deliberately unmapped
 ///     mov rdx, 10
-///     int 0x80                  ; rax = result — expected: u64::MAX
-///     cmp rax, -1
-///     je  rejected
-/// not_rejected:
-///     mov rax, SYS_WRITE
-///     mov rdi, 1
-///     mov rsi, fail_msg_addr
-///     mov rdx, BAD_POINTER_NOT_REJECTED_MSG.len()
-///     int 0x80
-///     jmp done
-/// rejected:
-///     mov rax, SYS_WRITE
-///     mov rdi, 1
-///     mov rsi, ok_msg_addr
-///     mov rdx, BAD_POINTER_REJECTED_MSG.len()
-///     int 0x80
-/// done:
-///     mov rax, SYS_EXIT
-///     int 0x80
-/// fail_msg: "BUG: bad pointer was not rejected!\n"
-/// ok_msg: "bad pointer correctly rejected by copy_from_user\n"
+///     int 0x80                  ; never returns
 /// ```
 ///
-/// Proves `syscall::copy_from_user`/`copy_to_user` actually protect the
-/// kernel, not just that they exist and compile: before they existed, this
-/// exact `write` call would have page-faulted straight into a kernel
-/// panic (see `interrupts::page_fault_handler`) — this demo running to
-/// completion and printing the "correctly rejected" message *is* the
-/// proof, the same way the reclamation demos elsewhere in this module
-/// prove themselves by not panicking rather than by asserting anything
-/// directly.
-fn build_bad_pointer_shellcode(page_addr: u64) -> Vec<u8> {
+/// That's the whole thing — deliberately not a shellcode that checks its
+/// own result and reports on it the way `build_open_read_shellcode` does.
+/// `syscall::copy_from_user` kills the calling thread outright on a bad
+/// pointer (`scheduler::kill_current_thread`) rather than handing back an
+/// error for the caller to notice, so there's no return value here worth
+/// checking — this `int 0x80` simply never comes back to whatever would
+/// follow it. The proof that `copy_from_user` actually works is
+/// `kill_current_thread`'s own log line appearing in the boot output,
+/// immediately followed by the rest of boot continuing normally — this
+/// demo proves itself by *not* being what takes the kernel down, the same
+/// way the reclamation demos elsewhere in this module do.
+fn build_bad_pointer_shellcode() -> Vec<u8> {
     let mut code = Vec::new();
 
     mov_imm64(&mut code, RAX, syscall::SYS_WRITE);
     mov_imm64(&mut code, RDI, 1); // fd = stdout
     mov_imm64(&mut code, RSI, BAD_POINTER);
     mov_imm64(&mut code, RDX, 10);
-    code.extend_from_slice(&[0xcd, 0x80]); // int 0x80
-    cmp_r64_imm8(&mut code, RAX, 0xFF); // cmp rax, -1
-    let je_opcode_at = code.len();
-    code.extend_from_slice(&[0x74, 0x00]); // je rejected (patched below)
-
-    // not_rejected: the bug case.
-    mov_imm64(&mut code, RAX, syscall::SYS_WRITE);
-    mov_imm64(&mut code, RDI, 1);
-    let fail_msg_patch_at = code.len() + 2;
-    mov_imm64(&mut code, RSI, 0); // fail_msg_addr, patched in below
-    mov_imm64(&mut code, RDX, BAD_POINTER_NOT_REJECTED_MSG.len() as u64);
-    code.extend_from_slice(&[0xcd, 0x80]); // int 0x80
-    let jmp_done_opcode_at = code.len();
-    code.extend_from_slice(&[0xeb, 0x00]); // jmp done (patched below)
-
-    // rejected: the expected case.
-    let rejected = code.len();
-    code[je_opcode_at + 1] = rel8(rejected, je_opcode_at + 2);
-    mov_imm64(&mut code, RAX, syscall::SYS_WRITE);
-    mov_imm64(&mut code, RDI, 1);
-    let ok_msg_patch_at = code.len() + 2;
-    mov_imm64(&mut code, RSI, 0); // ok_msg_addr, patched in below
-    mov_imm64(&mut code, RDX, BAD_POINTER_REJECTED_MSG.len() as u64);
-    code.extend_from_slice(&[0xcd, 0x80]); // int 0x80
-
-    // done:
-    let done = code.len();
-    code[jmp_done_opcode_at + 1] = rel8(done, jmp_done_opcode_at + 2);
-    mov_imm64(&mut code, RAX, syscall::SYS_EXIT);
     code.extend_from_slice(&[0xcd, 0x80]); // int 0x80, never returns
-
-    // The two fixed messages immediately follow the code — now that the
-    // code is fully assembled, their real addresses are known.
-    let fail_msg_addr = page_addr + code.len() as u64;
-    code[fail_msg_patch_at..fail_msg_patch_at + 8].copy_from_slice(&fail_msg_addr.to_le_bytes());
-    code.extend_from_slice(BAD_POINTER_NOT_REJECTED_MSG);
-
-    let ok_msg_addr = page_addr + code.len() as u64;
-    code[ok_msg_patch_at..ok_msg_patch_at + 8].copy_from_slice(&ok_msg_addr.to_le_bytes());
-    code.extend_from_slice(BAD_POINTER_REJECTED_MSG);
 
     code
 }
 
 /// Build a fresh, isolated address space, map the bad-pointer demo
-/// shellcode into it, and — if `run` — spawn a thread that drops into it.
-/// Same shape as `spawn_open_read_demo`; safe to leave permanently enabled
-/// for the same reason — it runs exactly once and exits for good.
+/// shellcode into it, and — if `run` — spawn a thread that drops into it,
+/// returning its `Pid` (or `None` if `run` was false). Same shape as
+/// `spawn_open_read_demo`; safe to leave permanently enabled for a related
+/// but not identical reason — this thread doesn't exit on its own at all,
+/// it gets killed (`scheduler::kill_current_thread`) inside its one and
+/// only syscall, which reclaims everything about it exactly the way a
+/// voluntary exit would.
 pub fn spawn_bad_pointer_demo(
     kernel_mapper: &mut OffsetPageTable<'_>,
     physical_memory_offset: VirtAddr,
     frame_allocator: &mut impl FrameAllocator<Size4KiB>,
     run: bool,
-) {
+) -> Option<scheduler::Pid> {
     let (l4_frame, mut isolated_mapper) =
         unsafe { memory::new_address_space(physical_memory_offset, frame_allocator) };
 
-    let code = build_bad_pointer_shellcode(BAD_POINTER_DEMO_ADDR);
+    let code = build_bad_pointer_shellcode();
     map_shellcode_page(
         &mut isolated_mapper,
         frame_allocator,
@@ -545,15 +485,15 @@ pub fn spawn_bad_pointer_demo(
         &code,
     );
 
-    if run {
+    run.then(|| {
         scheduler::spawn_isolated(
             run_bad_pointer_demo,
             l4_frame,
             kernel_mapper,
             &mut isolated_mapper,
             frame_allocator,
-        );
-    }
+        )
+    })
 }
 
 /// Spawned via `spawn_bad_pointer_demo`. Same shape as `run_open_read_demo`
@@ -562,6 +502,137 @@ pub fn spawn_bad_pointer_demo(
 pub fn run_bad_pointer_demo() -> ! {
     let entry = VirtAddr::new(BAD_POINTER_DEMO_ADDR);
     let stack_top = VirtAddr::new(BAD_POINTER_DEMO_ADDR + 4096 - 16);
+
+    unsafe {
+        enter_ring3(entry, stack_top);
+    }
+}
+
+/// Where the spawn/wait demo's code+stack page lives — another P4 slot
+/// nothing else in this kernel uses.
+const SPAWN_WAIT_DEMO_ADDR: u64 = 0x7C00_0000_0000;
+
+/// The 8.3 name of the on-disk program (`disk/greet.s`, via build.rs) this
+/// demo spawns — deliberately not `ECHO.ELF`, which loops forever and
+/// never calls `SYS_EXIT`: a parent that spawned and then waited on it
+/// would wait forever. `GREET.ELF` prints one line and exits immediately,
+/// so `sys_wait` actually comes back.
+const SPAWN_WAIT_CHILD_PATH: &[u8] = b"GREET.ELF";
+
+const SPAWN_WAIT_DONE_MSG: &[u8] = b"spawn/wait demo: child finished, parent resumed\n";
+
+/// Builds:
+///
+/// ```text
+///     mov rax, SYS_SPAWN
+///     mov rdi, path_addr        ; "GREET.ELF"
+///     mov rsi, path_len
+///     int 0x80                  ; rax = pid (or u64::MAX)
+///     mov rdi, rax               ; pid -> rdi for wait
+///     mov rax, SYS_WAIT
+///     int 0x80                   ; rax = 0 once the child has exited
+///     mov rax, SYS_WRITE
+///     mov rdi, 1                  ; fd = stdout
+///     mov rsi, done_msg_addr
+///     mov rdx, SPAWN_WAIT_DONE_MSG.len()
+///     int 0x80
+///     mov rax, SYS_EXIT
+///     int 0x80
+/// path: "GREET.ELF"
+/// done_msg: "spawn/wait demo: child finished, parent resumed\n"
+/// ```
+///
+/// The whole point of this demo: prove a *running ring-3 program* — not
+/// just kernel boot code — can load and launch another one by path
+/// (`syscall::SYS_SPAWN`) and block until it finishes
+/// (`syscall::SYS_WAIT`), the piece a real shell needs that no earlier
+/// demo in this module exercises. No branching on `sys_spawn`'s result:
+/// if it fails (returns `u64::MAX`), the `sys_wait` right after gets
+/// handed that same `u64::MAX` as a "pid", which `scheduler::thread_alive`
+/// correctly reports as never having existed — so `wait` returns
+/// immediately either way, and this still reaches its own exit rather than
+/// hanging.
+fn build_spawn_wait_shellcode(page_addr: u64) -> Vec<u8> {
+    let mut code = Vec::new();
+
+    mov_imm64(&mut code, RAX, syscall::SYS_SPAWN);
+    let path_ptr_patch_at = code.len() + 2;
+    mov_imm64(&mut code, RDI, 0); // path_addr, patched in below
+    mov_imm64(&mut code, RSI, SPAWN_WAIT_CHILD_PATH.len() as u64);
+    code.extend_from_slice(&[0xcd, 0x80]); // int 0x80
+    mov_r64_r64(&mut code, RDI, RAX); // pid -> rdi
+
+    mov_imm64(&mut code, RAX, syscall::SYS_WAIT);
+    code.extend_from_slice(&[0xcd, 0x80]); // int 0x80
+
+    mov_imm64(&mut code, RAX, syscall::SYS_WRITE);
+    mov_imm64(&mut code, RDI, 1); // fd = stdout
+    let done_msg_patch_at = code.len() + 2;
+    mov_imm64(&mut code, RSI, 0); // done_msg_addr, patched in below
+    mov_imm64(&mut code, RDX, SPAWN_WAIT_DONE_MSG.len() as u64);
+    code.extend_from_slice(&[0xcd, 0x80]); // int 0x80
+
+    mov_imm64(&mut code, RAX, syscall::SYS_EXIT);
+    code.extend_from_slice(&[0xcd, 0x80]); // int 0x80, never returns
+
+    // The path string and done-message immediately follow the code — now
+    // that the code is fully assembled, their real addresses are known.
+    let path_addr = page_addr + code.len() as u64;
+    code[path_ptr_patch_at..path_ptr_patch_at + 8].copy_from_slice(&path_addr.to_le_bytes());
+    code.extend_from_slice(SPAWN_WAIT_CHILD_PATH);
+
+    let done_msg_addr = page_addr + code.len() as u64;
+    code[done_msg_patch_at..done_msg_patch_at + 8].copy_from_slice(&done_msg_addr.to_le_bytes());
+    code.extend_from_slice(SPAWN_WAIT_DONE_MSG);
+
+    code
+}
+
+/// Build a fresh, isolated address space, map the spawn/wait demo
+/// shellcode into it, and — if `run` — spawn a thread that drops into it,
+/// returning its `Pid` (or `None` if `run` was false). Same shape as
+/// `spawn_open_read_demo`; safe to leave permanently enabled for the same
+/// reason — it (and the child it spawns) each run exactly once and exit
+/// for good. `main.rs` waits on the returned `Pid` before moving on, same
+/// as it does for the other syscall demos — see its own comment for why
+/// that matters more here than it might look: this one's own `sys_wait`
+/// keeps it alive and actively scheduling for as long as its child takes
+/// to run, not just for one syscall's worth of time.
+pub fn spawn_spawn_wait_demo(
+    kernel_mapper: &mut OffsetPageTable<'_>,
+    physical_memory_offset: VirtAddr,
+    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
+    run: bool,
+) -> Option<scheduler::Pid> {
+    let (l4_frame, mut isolated_mapper) =
+        unsafe { memory::new_address_space(physical_memory_offset, frame_allocator) };
+
+    let code = build_spawn_wait_shellcode(SPAWN_WAIT_DEMO_ADDR);
+    map_shellcode_page(
+        &mut isolated_mapper,
+        frame_allocator,
+        physical_memory_offset,
+        SPAWN_WAIT_DEMO_ADDR,
+        &code,
+    );
+
+    run.then(|| {
+        scheduler::spawn_isolated(
+            run_spawn_wait_demo,
+            l4_frame,
+            kernel_mapper,
+            &mut isolated_mapper,
+            frame_allocator,
+        )
+    })
+}
+
+/// Spawned via `spawn_spawn_wait_demo`. Same shape as `run_open_read_demo`
+/// — it's the address space and the shellcode `spawn_spawn_wait_demo`
+/// already set up (not this function) that make it what it is.
+pub fn run_spawn_wait_demo() -> ! {
+    let entry = VirtAddr::new(SPAWN_WAIT_DEMO_ADDR);
+    let stack_top = VirtAddr::new(SPAWN_WAIT_DEMO_ADDR + 4096 - 16);
 
     unsafe {
         enter_ring3(entry, stack_top);
@@ -650,7 +721,7 @@ fn build_test_elf(load_addr: u64) -> Vec<u8> {
 pub fn spawn_elf_demo(
     kernel_mapper: &mut OffsetPageTable<'_>,
     physical_memory_offset: VirtAddr,
-    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
+    frame_allocator: &mut (impl FrameAllocator<Size4KiB> + FrameDeallocator<Size4KiB>),
     run: bool,
 ) {
     let elf_bytes = build_test_elf(ELF_LOAD_ADDR);
@@ -668,7 +739,7 @@ pub fn spawn_disk_elf_demo(
     elf_bytes: &[u8],
     kernel_mapper: &mut OffsetPageTable<'_>,
     physical_memory_offset: VirtAddr,
-    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
+    frame_allocator: &mut (impl FrameAllocator<Size4KiB> + FrameDeallocator<Size4KiB>),
     run: bool,
 ) {
     spawn_loaded_elf_demo(elf_bytes, kernel_mapper, physical_memory_offset, frame_allocator, run);
@@ -678,11 +749,16 @@ fn spawn_loaded_elf_demo(
     elf_bytes: &[u8],
     kernel_mapper: &mut OffsetPageTable<'_>,
     physical_memory_offset: VirtAddr,
-    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
+    frame_allocator: &mut (impl FrameAllocator<Size4KiB> + FrameDeallocator<Size4KiB>),
     run: bool,
 ) {
+    // Trusted input either way (a binary this kernel built itself, or the
+    // one build.rs put on fs.img) — unlike `syscall::sys_spawn`, which
+    // hands `elf::load` an arbitrary ring-3-named path and has to handle
+    // `None` for real.
     let (mut isolated_mapper, loaded) =
-        elf::load(elf_bytes, physical_memory_offset, frame_allocator);
+        elf::load(elf_bytes, physical_memory_offset, frame_allocator)
+            .expect("elf::load: kernel's own or build.rs's ECHO.ELF should always be well-formed");
 
     crate::println!(
         "[elf]   loaded OK — entry={:#x}, stack_top={:#x}",
@@ -723,11 +799,15 @@ pub fn run_elf_demo() -> ! {
 /// `iretq` doesn't "return" here in the normal sense — from this point on
 /// the CPU is running at CPL 3, executing whatever's at `entry`.
 ///
+/// `pub(crate)` rather than private: `scheduler::ring3_trampoline` calls
+/// this directly too, for a thread spawned via `scheduler::spawn_user`
+/// rather than one of this module's own fixed boot-time demos.
+///
 /// # Safety
 /// `entry` and `stack_top` must point into a page mapped PRESENT |
 /// USER_ACCESSIBLE (and, since it also serves as the stack, WRITABLE) —
 /// see `map_demo_page`.
-unsafe fn enter_ring3(entry: VirtAddr, stack_top: VirtAddr) -> ! {
+pub(crate) unsafe fn enter_ring3(entry: VirtAddr, stack_top: VirtAddr) -> ! {
     let (code_selector, data_selector) = gdt::user_selectors();
 
     unsafe {

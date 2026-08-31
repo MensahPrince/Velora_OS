@@ -38,14 +38,23 @@ use x86_64::{
 /// is in flight.
 const MAX_THREADS: usize = 16;
 
-/// 16 KiB per kernel thread. Plenty for the simple demo threads this
-/// kernel spawns (a loop, a println!, a spin-wait); revisit if threads
-/// start doing deep recursion. Kept modest since the heap itself is only
-/// 1 MiB (see src/allocator.rs) — each thread's stack comes out of it.
-/// A multiple of 4096: stacks are allocated page-aligned (see `spawn`),
-/// which `spawn_isolated` relies on to map a precise, non-overlapping
-/// range of whole pages into an isolated address space.
-const STACK_SIZE: usize = 16 * 1024;
+/// Bumped from the original 16 KiB, which was plenty for the simple demo
+/// threads this kernel spawned early on (a loop, a println!, a spin-wait)
+/// but not for `syscall::sys_spawn`: that's the first syscall to run
+/// `elf::load` from *inside* a thread's own 16 KiB kernel stack rather
+/// than from `kernel_main`'s own much larger one (every earlier ELF-
+/// loading demo called it directly from there) — and in an unoptimized
+/// debug build, `dispatch -> sys_spawn -> spawn_from_path -> elf::load`'s
+/// own (non-recursive, but many-frames-deep) call chain measured out to
+/// over 20 KiB of stack on its own, overflowing straight past the bottom
+/// of the 16 KiB stack into whatever unmapped memory happened to sit
+/// below it — silently corrupting state until something (usually a page
+/// fault escalating to a double fault, since there's no guard page here)
+/// finally noticed. 64 KiB leaves real headroom for that and deeper call
+/// chains like it. A multiple of 4096: stacks are allocated page-aligned
+/// (see `spawn`), which `spawn_isolated` relies on to map a precise,
+/// non-overlapping range of whole pages into an isolated address space.
+const STACK_SIZE: usize = 64 * 1024;
 
 pub type ThreadId = usize;
 
@@ -91,6 +100,17 @@ struct Thread {
     /// forced back to the shared kernel table (see that function), so the
     /// heap these `Vec`s are backed by is guaranteed mapped.
     open_files: [Option<OpenFile>; MAX_OPEN_FILES],
+    /// For a thread meant to drop into ring 3 via the shared
+    /// `ring3_trampoline` (`spawn_user`, below) — the user-mode entry
+    /// point and initial stack pointer, consumed once the same way
+    /// `entry` is. `None` for every other thread: the fixed handful of
+    /// boot-time demos in src/userspace.rs each carry their own dedicated
+    /// entry/stack-top statics instead (fine for them — there's only ever
+    /// one of each in flight at a time — but that doesn't generalize to
+    /// spawning arbitrary programs on demand, where two spawns could race
+    /// to stomp the same statics), and the boot thread never runs through
+    /// any trampoline at all.
+    user_entry: Option<(VirtAddr, VirtAddr)>,
 }
 
 /// A file `syscall::SYS_OPEN` has already read in full from `fs::read_file`
@@ -181,6 +201,34 @@ struct SchedulerState {
     /// `schedule()` and `exit_current_thread()`, so nothing new can be
     /// switched away from until the previous one is cleared.
     zombie: Option<ThreadId>,
+    /// Bumped every time thread-table slot `i` is (re)populated with a new
+    /// thread (`spawn`, `spawn_isolated_inner`, and the boot thread's own
+    /// creation in `init`) — see `Pid`'s own doc comment for why: without
+    /// this, `thread_alive` polling "is slot N's thread still there" could
+    /// be fooled by an unrelated *later* thread that happens to reuse the
+    /// same slot after the one actually being waited for already exited —
+    /// with `MAX_THREADS` this small, and threads already cycling through
+    /// every slot repeatedly within a single boot (see the reclamation
+    /// demos in main.rs), a real possibility, not just a theoretical one.
+    slot_generations: [u64; MAX_THREADS],
+}
+
+/// An opaque handle to a specific thread, returned by `spawn_isolated`/
+/// `spawn_user` and consumed by `thread_alive` (which `syscall::sys_wait`
+/// polls). Packs a thread-table slot index together with that slot's
+/// generation at the time this pid was issued
+/// (`SchedulerState::slot_generations`), so a stale pid can't be confused
+/// with an unrelated later thread that happens to reuse the same slot —
+/// see `slot_generations`'s own doc comment for why that's a real risk
+/// here, not a theoretical one.
+pub type Pid = u64;
+
+fn pack_pid(slot: ThreadId, generation: u64) -> Pid {
+    (generation << 8) | slot as u64
+}
+
+fn unpack_pid(pid: Pid) -> (ThreadId, u64) {
+    ((pid & 0xFF) as ThreadId, pid >> 8)
 }
 
 static SCHEDULER: Mutex<Option<SchedulerState>> = Mutex::new(None);
@@ -202,11 +250,18 @@ pub fn init() {
                 page_table: None,
                 kernel_stack_top: 0,
                 open_files: core::array::from_fn(|_| None),
+                user_entry: None,
             })
         } else {
             None
         }
     });
+    // Slot 0's own first (and only) generation — every other slot starts
+    // at 0, meaning "never yet populated"; `spawn`/`spawn_isolated_inner`
+    // bump a slot to its next generation right before creating the thread
+    // that goes into it, so those start at 1 the same way.
+    let mut slot_generations = [0u64; MAX_THREADS];
+    slot_generations[0] = 1;
 
     interrupts::without_interrupts(|| {
         let (kernel_page_table, _) = Cr3::read();
@@ -216,6 +271,7 @@ pub fn init() {
             current: 0,
             kernel_page_table,
             zombie: None,
+            slot_generations,
         });
     });
 }
@@ -344,6 +400,7 @@ pub fn spawn(entry: fn() -> !) {
             .iter()
             .position(Option::is_none)
             .expect("thread table full (MAX_THREADS exceeded)");
+        state.slot_generations[id] += 1;
 
         state.threads[id] = Some(Thread {
             stack_pointer,
@@ -353,6 +410,7 @@ pub fn spawn(entry: fn() -> !) {
             page_table: None,
             kernel_stack_top: stack_base as u64 + STACK_SIZE as u64,
             open_files: core::array::from_fn(|_| None),
+            user_entry: None,
         });
         state.ready_queue.push_back(id);
     });
@@ -368,13 +426,61 @@ pub fn spawn(entry: fn() -> !) {
 /// `isolated_mapper` is the one `memory::new_address_space` handed back
 /// alongside `page_table`, for mapping pages into the new space before
 /// anything runs under it.
+///
+/// Returns the new thread's `Pid` — mostly useful via `spawn_user` below,
+/// but returned here too for the same reason; nothing stops a caller from
+/// ignoring it, as every existing call site (the boot-time demos in
+/// src/userspace.rs, none of which need to wait on themselves) does.
 pub fn spawn_isolated(
     entry: fn() -> !,
     page_table: PhysFrame,
     kernel_mapper: &mut OffsetPageTable,
     isolated_mapper: &mut OffsetPageTable,
     frame_allocator: &mut impl FrameAllocator<Size4KiB>,
-) {
+) -> Pid {
+    spawn_isolated_inner(entry, None, page_table, kernel_mapper, isolated_mapper, frame_allocator)
+}
+
+/// Like `spawn_isolated`, but for a thread meant to run a *dynamically*
+/// loaded ring-3 program (`syscall::sys_spawn`) rather than one of the
+/// fixed handful of boot-time demos in src/userspace.rs. Those demos each
+/// get away with their own dedicated pair of global statics
+/// (`userspace::ELF_DEMO_ENTRY`/`ELF_DEMO_STACK_TOP`) plus a matching
+/// one-off trampoline function, because there's only ever one of each in
+/// flight at a time — that doesn't generalize to spawning arbitrary
+/// programs on demand, where two spawns could race to stomp the same
+/// statics. `ring3_trampoline` (below) reads `user_entry`/`user_stack_top`
+/// back out of *this thread's own* `Thread` entry instead, so any number
+/// of these can be in flight at once.
+pub fn spawn_user(
+    user_entry: VirtAddr,
+    user_stack_top: VirtAddr,
+    page_table: PhysFrame,
+    kernel_mapper: &mut OffsetPageTable,
+    isolated_mapper: &mut OffsetPageTable,
+    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
+) -> Pid {
+    spawn_isolated_inner(
+        ring3_trampoline,
+        Some((user_entry, user_stack_top)),
+        page_table,
+        kernel_mapper,
+        isolated_mapper,
+        frame_allocator,
+    )
+}
+
+/// The shared body of `spawn_isolated` and `spawn_user` — identical in
+/// every way except which trampoline the new thread starts at, and
+/// whether it carries a `user_entry` for that trampoline to consume.
+fn spawn_isolated_inner(
+    entry: fn() -> !,
+    user_entry: Option<(VirtAddr, VirtAddr)>,
+    page_table: PhysFrame,
+    kernel_mapper: &mut OffsetPageTable,
+    isolated_mapper: &mut OffsetPageTable,
+    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
+) -> Pid {
     interrupts::without_interrupts(|| {
         let layout = Layout::from_size_align(STACK_SIZE, 4096).unwrap();
         let stack_base = unsafe { alloc::alloc::alloc(layout) };
@@ -423,6 +529,8 @@ pub fn spawn_isolated(
             .iter()
             .position(Option::is_none)
             .expect("thread table full (MAX_THREADS exceeded)");
+        state.slot_generations[id] += 1;
+        let generation = state.slot_generations[id];
 
         state.threads[id] = Some(Thread {
             stack_pointer,
@@ -432,9 +540,12 @@ pub fn spawn_isolated(
             page_table: Some(page_table),
             kernel_stack_top: stack_base as u64 + STACK_SIZE as u64,
             open_files: core::array::from_fn(|_| None),
+            user_entry,
         });
         state.ready_queue.push_back(id);
-    });
+
+        pack_pid(id, generation)
+    })
 }
 
 /// Lay down a fake "already switched away" frame at the top of a fresh
@@ -505,6 +616,44 @@ extern "C" fn thread_trampoline() -> ! {
     entry();
 }
 
+/// Where a thread spawned via `spawn_user` starts — stored as its `entry`
+/// the same way any other thread's real entry point is, so it's
+/// `thread_trampoline`'s own call to `entry()` that reaches this, not a
+/// raw `ret`; a plain fn (not `extern "C"`, unlike `thread_trampoline`
+/// itself) for exactly that reason. Consumes this thread's own
+/// `user_entry` (set once, by `spawn_user`) and drops straight to ring 3
+/// there; never returns.
+fn ring3_trampoline() -> ! {
+    let (entry, stack_top) = interrupts::without_interrupts(|| {
+        let mut guard = SCHEDULER.lock();
+        let state = guard.as_mut().expect("scheduler not initialized");
+        state.threads[state.current]
+            .as_mut()
+            .and_then(|t| t.user_entry.take())
+            .expect("ring3_trampoline entered for a thread with no user entry point")
+    });
+
+    // No interrupts::enable() needed here, unlike thread_trampoline: this
+    // is reached *through* thread_trampoline's own call to entry(), so
+    // interrupts are already enabled by the time execution gets here.
+    unsafe { crate::userspace::enter_ring3(entry, stack_top) }
+}
+
+/// Whether `pid` (from `spawn_isolated`/`spawn_user`) still refers to a
+/// thread that hasn't finished yet — `syscall::sys_wait` polls this in a
+/// loop (`yield_now`-ing between checks) to implement "block until the
+/// child exits" without any real blocking/wait-queue primitive. Checks the
+/// slot's *generation* against the one packed into `pid`, not just whether
+/// the slot is occupied — see `Pid`'s own doc comment for why.
+pub fn thread_alive(pid: Pid) -> bool {
+    let (slot, generation) = unpack_pid(pid);
+    interrupts::without_interrupts(|| {
+        let guard = SCHEDULER.lock();
+        let state = guard.as_ref().expect("scheduler not initialized");
+        slot < MAX_THREADS && state.threads[slot].is_some() && state.slot_generations[slot] == generation
+    })
+}
+
 /// Called from the timer interrupt handler. Rotates to the next ready
 /// thread, if there is one to switch to.
 pub fn tick() {
@@ -517,12 +666,37 @@ pub fn yield_now() {
     schedule();
 }
 
+/// Terminate the calling thread involuntarily — a fault, not a clean
+/// `exit()` — logging `reason` first so the kill is actually visible in
+/// the boot log rather than looking identical to a normal exit. Reached
+/// from `syscall::copy_from_user`/`copy_to_user` (src/syscall.rs) when a
+/// ring-3 program hands a syscall a pointer that isn't safely its own to
+/// touch: before this existed, that same situation page-faulted straight
+/// into a kernel panic (see `interrupts::page_fault_handler`) — one
+/// process's bad pointer taking the whole kernel down with it. Killing
+/// just the offending thread instead needs nothing beyond
+/// `exit_current_thread` itself: every reclamation it already does (kernel
+/// stack, isolated address space, open files, thread-table slot) applies
+/// exactly the same whether the thread is exiting on purpose or being cut
+/// off mid-syscall.
+///
+/// `println!` is safe to call here regardless of which address space is
+/// currently active: it only ever touches the VGA buffer, a fixed
+/// physical address identity-mapped into every address space this kernel
+/// builds, the same reasoning `syscall::sys_write`'s own doc comment
+/// already relies on.
+pub fn kill_current_thread(reason: &str) -> ! {
+    crate::println!("[proc]  thread killed: {}", reason);
+    exit_current_thread()
+}
+
 /// Terminate the calling thread for good: remove it from the round-robin
 /// rotation, switch to another ready thread, and (once it's safe — see
 /// `reap_zombie`) free its kernel stack and reuse its slot in the thread
-/// table. Callable directly by kernel-mode thread bodies, or reached from
-/// ring 3 via the syscall ABI (`syscall::SYS_EXIT` — see src/syscall.rs);
-/// either way this is the only place that actually implements it.
+/// table. Callable directly by kernel-mode thread bodies, reached from
+/// ring 3 via the syscall ABI (`syscall::SYS_EXIT` — see src/syscall.rs),
+/// or involuntarily via `kill_current_thread` above; either way this is
+/// the only place that actually implements it.
 ///
 /// Also frees the physical frames backing an isolated thread's own address
 /// space — its L4 table, and whatever `elf::load`/

@@ -18,7 +18,8 @@ use crate::memory;
 use x86_64::{
     VirtAddr,
     structures::paging::{
-        FrameAllocator, Mapper, OffsetPageTable, Page, PageTableFlags, PhysFrame, Size4KiB,
+        FrameAllocator, FrameDeallocator, Mapper, OffsetPageTable, Page, PageTableFlags, PhysFrame,
+        Size4KiB,
     },
 };
 
@@ -45,109 +46,149 @@ pub struct LoadedElf {
     pub stack_top: VirtAddr,
 }
 
-fn read_u16(bytes: &[u8], offset: usize) -> u16 {
-    u16::from_le_bytes(bytes[offset..offset + 2].try_into().unwrap())
+/// Read a little-endian integer at `base + offset` — `None` if that range
+/// falls outside `bytes` at all, computed via `checked_add` rather than
+/// plain `+` so a `base`/`offset` combination near `usize::MAX` (fully
+/// attacker-controlled: `base` is usually a program-header offset read
+/// straight out of the file) fails cleanly instead of overflowing.
+fn read_u16(bytes: &[u8], base: usize, offset: usize) -> Option<u16> {
+    let start = base.checked_add(offset)?;
+    let end = start.checked_add(2)?;
+    Some(u16::from_le_bytes(bytes.get(start..end)?.try_into().ok()?))
 }
-fn read_u32(bytes: &[u8], offset: usize) -> u32 {
-    u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
+fn read_u32(bytes: &[u8], base: usize, offset: usize) -> Option<u32> {
+    let start = base.checked_add(offset)?;
+    let end = start.checked_add(4)?;
+    Some(u32::from_le_bytes(bytes.get(start..end)?.try_into().ok()?))
 }
-fn read_u64(bytes: &[u8], offset: usize) -> u64 {
-    u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
+fn read_u64(bytes: &[u8], base: usize, offset: usize) -> Option<u64> {
+    let start = base.checked_add(offset)?;
+    let end = start.checked_add(8)?;
+    Some(u64::from_le_bytes(bytes.get(start..end)?.try_into().ok()?))
 }
 
 /// Parse `bytes` as an ELF64 executable, build a fresh address space for
 /// it (`memory::new_address_space`), map each PT_LOAD segment and a user
 /// stack into it, and return what's needed to actually run it plus the
 /// mapper for that new address space — the caller still needs that to
-/// call `scheduler::spawn_isolated`, which shares the running thread's own
-/// kernel stack into it.
+/// call `scheduler::spawn_isolated`/`spawn_user`, which shares the running
+/// thread's own kernel stack into it.
 ///
-/// # Panics
-/// On anything that doesn't look like a well-formed ELF64 x86-64
-/// executable this loader can actually handle (bad magic, wrong class/
-/// endianness/machine/type, a segment vaddr that isn't page-aligned). A
-/// real loader would reject a bad binary and let its caller decide what
-/// to do; panicking is an accepted simplification while the only ELF this
-/// kernel ever loads is the one it built itself (see
-/// `userspace::build_test_elf`).
+/// Returns `None` — never panics — on anything that doesn't look like a
+/// well-formed ELF64 x86-64 executable this loader can actually handle
+/// (too short, bad magic, wrong class/endianness/machine/type, a
+/// truncated or out-of-range program header table, a segment vaddr that
+/// isn't page-aligned or overflows the address space, ...). This used to
+/// be a set of `assert!`s — an accepted shortcut while the only ELF this
+/// kernel ever loaded was one it built itself (`userspace::build_test_elf`)
+/// or `disk/echo.s`, both trusted by construction. `syscall::sys_spawn`
+/// changed that: it can hand this an arbitrary file a ring-3 program named
+/// by path, and a malformed one panicking the entire kernel over one
+/// process's bad choice of file is exactly the class of bug this kernel
+/// spent real effort closing elsewhere (see `fs::read_file`,
+/// `syscall::copy_from_user`) — this loader needed the same treatment.
+///
+/// On failure, whatever `memory::new_address_space` (and any segment
+/// already mapped before the failure) allocated is freed back
+/// (`memory::free_address_space`) rather than leaked — this address space
+/// never got far enough to have anything shared into it the way
+/// `scheduler::spawn_user` eventually would, so there's nothing to
+/// preserve.
 pub fn load(
     bytes: &[u8],
     physical_memory_offset: VirtAddr,
-    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
-) -> (OffsetPageTable<'static>, LoadedElf) {
-    assert!(bytes.len() >= 64, "ELF file too short to hold a header");
-    assert_eq!(&bytes[0..4], &EI_MAG, "not an ELF file (bad magic)");
-    assert_eq!(bytes[4], ELFCLASS64, "only 64-bit ELF is supported");
-    assert_eq!(bytes[5], ELFDATA2LSB, "only little-endian ELF is supported");
-    assert_eq!(
-        read_u16(bytes, 16),
-        ET_EXEC,
-        "only static ET_EXEC binaries are supported (no PIE, no dynamic linking)"
-    );
-    assert_eq!(read_u16(bytes, 18), EM_X86_64, "not an x86-64 ELF file");
-
-    let entry = read_u64(bytes, 24);
-    let phoff = read_u64(bytes, 32) as usize;
-    let phentsize = read_u16(bytes, 54) as usize;
-    let phnum = read_u16(bytes, 56) as usize;
+    frame_allocator: &mut (impl FrameAllocator<Size4KiB> + FrameDeallocator<Size4KiB>),
+) -> Option<(OffsetPageTable<'static>, LoadedElf)> {
+    if bytes.len() < 64 {
+        return None;
+    }
+    if bytes[0..4] != EI_MAG || bytes[4] != ELFCLASS64 || bytes[5] != ELFDATA2LSB {
+        return None;
+    }
+    if read_u16(bytes, 0, 16)? != ET_EXEC || read_u16(bytes, 0, 18)? != EM_X86_64 {
+        return None;
+    }
 
     let (l4_frame, mut mapper) =
         unsafe { memory::new_address_space(physical_memory_offset, frame_allocator) };
 
+    match load_segments_and_stack(bytes, &mut mapper, physical_memory_offset, frame_allocator) {
+        Some((entry, stack_top)) => Some((
+            mapper,
+            LoadedElf {
+                page_table: l4_frame,
+                entry,
+                stack_top,
+            },
+        )),
+        None => {
+            unsafe { memory::free_address_space(l4_frame, physical_memory_offset, 0..0, frame_allocator) };
+            None
+        }
+    }
+}
+
+/// The part of `load` that can fail partway through, once the fixed ELF
+/// header is already validated and `new_address_space` has already built
+/// a fresh (so far empty) address space for it — pulled out on its own so
+/// `load` can free that address space on failure (`mapper` may already
+/// have some segments mapped into it from earlier iterations) instead of
+/// leaking it.
+fn load_segments_and_stack(
+    bytes: &[u8],
+    mapper: &mut OffsetPageTable<'_>,
+    physical_memory_offset: VirtAddr,
+    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
+) -> Option<(VirtAddr, VirtAddr)> {
+    let entry = read_u64(bytes, 0, 24)?;
+    let phoff = read_u64(bytes, 0, 32)? as usize;
+    let phentsize = read_u16(bytes, 0, 54)? as usize;
+    let phnum = read_u16(bytes, 0, 56)? as usize;
+
     let mut highest_mapped = 0u64;
 
     for i in 0..phnum {
-        let ph = phoff + i * phentsize;
-        if read_u32(bytes, ph) != PT_LOAD {
+        let ph = phoff.checked_add(i.checked_mul(phentsize)?)?;
+        if read_u32(bytes, ph, 0)? != PT_LOAD {
             continue;
         }
-        let p_flags = read_u32(bytes, ph + 4);
-        let p_offset = read_u64(bytes, ph + 8) as usize;
-        let p_vaddr = read_u64(bytes, ph + 16);
-        let p_filesz = read_u64(bytes, ph + 32) as usize;
-        let p_memsz = read_u64(bytes, ph + 40);
+        let p_flags = read_u32(bytes, ph, 4)?;
+        let p_offset = read_u64(bytes, ph, 8)? as usize;
+        let p_vaddr = read_u64(bytes, ph, 16)?;
+        let p_filesz = read_u64(bytes, ph, 32)? as usize;
+        let p_memsz = read_u64(bytes, ph, 40)?;
 
         let writable = p_flags & PF_W != 0;
-        let file_bytes = &bytes[p_offset..p_offset + p_filesz];
+        let file_end = p_offset.checked_add(p_filesz)?;
+        let file_bytes = bytes.get(p_offset..file_end)?;
         map_segment(
-            &mut mapper,
+            mapper,
             physical_memory_offset,
             frame_allocator,
             file_bytes,
             p_vaddr,
             p_memsz,
             writable,
-        );
+        )?;
 
-        highest_mapped = highest_mapped.max(p_vaddr + p_memsz);
+        highest_mapped = highest_mapped.max(p_vaddr.checked_add(p_memsz)?);
     }
 
-    let stack_bottom = align_up(highest_mapped, PAGE_SIZE) + PAGE_SIZE;
-    map_segment(
-        &mut mapper,
-        physical_memory_offset,
-        frame_allocator,
-        &[],
-        stack_bottom,
-        STACK_SIZE,
-        true,
-    );
+    let stack_bottom = align_up(highest_mapped, PAGE_SIZE)?.checked_add(PAGE_SIZE)?;
+    map_segment(mapper, physical_memory_offset, frame_allocator, &[], stack_bottom, STACK_SIZE, true)?;
     // 16-aligned, matching the same SysV requirement userspace.rs's hand
-    // demos already have to satisfy.
-    let stack_top = VirtAddr::new(stack_bottom + STACK_SIZE - 16);
+    // demos already have to satisfy. `VirtAddr::try_new` rather than
+    // `::new`: both this and `entry` below are arithmetic on values that
+    // ultimately trace back to attacker-controlled file content, so
+    // either can land on a non-canonical address `::new` would panic on.
+    let stack_top = VirtAddr::try_new(stack_bottom.checked_add(STACK_SIZE)?.checked_sub(16)?).ok()?;
+    let entry = VirtAddr::try_new(entry).ok()?;
 
-    (
-        mapper,
-        LoadedElf {
-            page_table: l4_frame,
-            entry: VirtAddr::new(entry),
-            stack_top,
-        },
-    )
+    Some((entry, stack_top))
 }
 
-fn align_up(addr: u64, align: u64) -> u64 {
-    (addr + align - 1) & !(align - 1)
+fn align_up(addr: u64, align: u64) -> Option<u64> {
+    Some(addr.checked_add(align - 1)? & !(align - 1))
 }
 
 /// Map `mem_size` bytes (rounded up to whole pages) at `vaddr`, copying
@@ -155,6 +196,16 @@ fn align_up(addr: u64, align: u64) -> u64 {
 /// ELF PT_LOAD behavior, where `p_memsz >= p_filesz` and the difference
 /// (typically a segment's BSS) is expected to read as zero. Also used
 /// (with `file_bytes` empty) to map the plain, zeroed stack page.
+///
+/// `None` — not a panic — for a `vaddr` that isn't page-aligned, or for a
+/// `vaddr`/`mem_size` combination that overflows or lands at or above the
+/// canonical-address boundary (bit 47 clear is required — `load`'s own
+/// address-space bookkeeping does its highest-address/alignment
+/// arithmetic on raw `u64`s and only calls `VirtAddr::try_new` at the
+/// point each segment actually gets mapped; a load address right at or
+/// above that boundary was found, empirically, to end up executing at
+/// CPL 3 with a GPF rather than running, for reasons not fully traced to
+/// a single line — this loader simply doesn't support it).
 fn map_segment(
     mapper: &mut OffsetPageTable<'_>,
     physical_memory_offset: VirtAddr,
@@ -163,37 +214,22 @@ fn map_segment(
     vaddr: u64,
     mem_size: u64,
     writable: bool,
-) {
+) -> Option<()> {
     if mem_size == 0 {
-        return;
+        return Some(());
     }
-    assert_eq!(
-        vaddr % PAGE_SIZE,
-        0,
-        "this minimal loader requires page-aligned segment addresses"
-    );
-    // Below the canonical-address boundary (bit 47 clear): this loader's
-    // own address-space bookkeeping (in `load`, above) does its
-    // highest-address/alignment arithmetic on raw u64s and only calls
-    // `VirtAddr::new` (which sign-extends bit 47 into bits 48-63) at the
-    // point each segment actually gets mapped — a load address placed
-    // right at or above that boundary was found (empirically, in
-    // development) to end up executing at CPL 3 with a GPF rather than
-    // running, for reasons not fully traced to a single line. Rather than
-    // ship that footgun, this loader simply doesn't support it yet: keep
-    // load addresses comfortably below 0x0000_8000_0000_0000.
-    assert!(
-        vaddr < 0x0000_8000_0000_0000,
-        "this minimal loader doesn't support segment addresses at or above the canonical boundary (2^47)"
-    );
+    if vaddr % PAGE_SIZE != 0 || vaddr >= 0x0000_8000_0000_0000 {
+        return None;
+    }
 
     let mut flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
     if writable {
         flags |= PageTableFlags::WRITABLE;
     }
 
-    let start_page = Page::<Size4KiB>::containing_address(VirtAddr::new(vaddr));
-    let end_page = Page::<Size4KiB>::containing_address(VirtAddr::new(vaddr + mem_size - 1));
+    let last_byte = vaddr.checked_add(mem_size)?.checked_sub(1)?;
+    let start_page = Page::<Size4KiB>::containing_address(VirtAddr::try_new(vaddr).ok()?);
+    let end_page = Page::<Size4KiB>::containing_address(VirtAddr::try_new(last_byte).ok()?);
     let page_count = end_page - start_page + 1;
 
     for i in 0..page_count {
@@ -226,4 +262,6 @@ fn map_segment(
             }
         }
     }
+
+    Some(())
 }
