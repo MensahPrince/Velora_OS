@@ -46,7 +46,7 @@ The project exists to develop a rigorous, from-scratch understanding of the mech
 
 - `ata::read_sector` implements polling-mode Programmed I/O against the legacy primary ATA interface (I/O ports `0x1F0`-`0x1F7`), sufficient to read arbitrary LBA28 sectors from either drive on that bus (`ata::Drive::Primary`/`Secondary`, selected via the drive-select bit — no second bus's worth of ports needed).
 - `fs::read_file` implements a minimal, read-only FAT16 driver: BIOS Parameter Block parsing, root-directory 8.3-name lookup, and cluster-chain following, sufficient to read a whole file back from the secondary drive. That drive carries a filesystem entirely independent of the boot disk (`ata::Drive::Primary`, whose sector 0 is still just the bootloader), built by real host tooling (`mkfs.fat`, `mtools`) rather than by this kernel itself — see `build.rs`.
-- `build.rs` assembles every real userspace program under `disk/` (each, e.g. `disk/echo.s`, linked via the shared `disk/link.ld` into a static, non-PIE ELF64 executable using the host's own `as`/`ld`) and copies them onto a freshly formatted FAT16 image (`fs.img`) as `ECHO.ELF`, `GREET.ELF`, and `SHELL.ELF`, attached to QEMU as the secondary drive. `SHELL.ELF` is what `main.rs` actually runs at boot now (via `fs::read_file` and the real ELF loader, `elf::load`): a real interactive shell — prompt, read a line, `syscall::SYS_SPAWN` whatever program it names, `SYS_WAIT` for it to finish, prompt again — the first thing in this kernel that turns typed input into a *launched program* rather than a fixed, hardcoded demo. `GREET.ELF` exists purely as something for the shell (or another program, via `SYS_SPAWN`) to launch that actually exits; `ECHO.ELF`'s own read/write echo loop never does, so it stays useful only as something to launch by hand and watch, the same way it always was.
+- `build.rs` assembles every real userspace program under `disk/` (each, e.g. `disk/echo.s`, linked via the shared `disk/link.ld` into a static, non-PIE ELF64 executable using the host's own `as`/`ld`) and copies them onto a freshly formatted FAT16 image (`fs.img`) as `ECHO.ELF`, `GREET.ELF`, and `SHELL.ELF`, attached to QEMU as the secondary drive. `SHELL.ELF` is what `main.rs` actually runs at boot now (via `fs::read_file` and the real ELF loader, `elf::load`): a real interactive shell — prompt, read a line, `syscall::SYS_SPAWN` whatever program it names, `SYS_WAIT` for it to finish, prompt again — the first thing in this kernel that turns typed input into a *launched program* rather than a fixed, hardcoded demo. `GREET.ELF` exists purely as something for the shell (or another program, via `SYS_SPAWN`) to launch that actually exits, and — by printing back whatever argument bytes it was given — as proof that `SYS_SPAWN`'s argument passing actually reaches a spawned program; `ECHO.ELF`'s own read/write echo loop never does, so it stays useful only as something to launch by hand and watch, the same way it always was.
 
 ## Project Structure
 
@@ -116,7 +116,7 @@ cargo test    # execute the integration test suite (headless)
 | Disk I/O | Implemented (PIO sector reads, primary + secondary drive) |
 | Filesystem | Implemented (read-only FAT16: file lookup by 8.3 name, cluster-chain reads) |
 | Process lifecycle (spawn/exit) | Implemented (thread-table slot, kernel-stack, and — for isolated processes — full address-space reclamation on exit) |
-| Interactive shell | Implemented (`disk/shell.s` — reads a program name from the keyboard, `spawn`s and `wait`s on it, then prompts again) |
+| Interactive shell | Implemented (`disk/shell.s` — reads a program name (and, after the first space, argument bytes passed through to it via `SYS_SPAWN`) from the keyboard, `spawn`s and `wait`s on it, then prompts again; Up/Down recall previous lines from a small in-memory history) |
 
 ## Known Limitations
 
@@ -126,7 +126,7 @@ cargo test    # execute the integration test suite (headless)
 
 ## Future Work
 
-In approximate dependency order: command-line arguments (`SYS_SPAWN` only takes a bare path today — the shell can launch a program, but can't pass it anything); true `fork()` (copy-on-write address-space duplication — `SYS_SPAWN` deliberately doesn't attempt this, see its own doc comment); killing just the offending process, rather than only ending its current syscall, on other classes of fault beyond a bad syscall pointer; and, further out, filesystem writes and subdirectory support.
+In approximate dependency order: in-line cursor movement in the shell (Left/Right and Home/End are recognized well enough to be drained without leaking into the typed line, but don't actually move the cursor yet — see `disk/shell.s`'s own known limitations); true `fork()` (copy-on-write address-space duplication — `SYS_SPAWN` deliberately doesn't attempt this, see its own doc comment); killing just the offending process, rather than only ending its current syscall, on other classes of fault beyond a bad syscall pointer; and, further out, filesystem writes and subdirectory support.
 
 ## References
 

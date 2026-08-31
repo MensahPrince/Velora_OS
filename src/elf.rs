@@ -36,6 +36,12 @@ const PAGE_SIZE: u64 = 4096;
 /// highest PT_LOAD segment so an off-by-one in a segment's own size can't
 /// run into it.
 const STACK_SIZE: u64 = PAGE_SIZE;
+/// Where `args` (see `load`) ends up in the new address space: one more
+/// page, right above the stack page. Always mapped, even for an empty
+/// `args` — one page is far more than `syscall::sys_spawn`'s own cap on
+/// how many argument bytes it'll ever copy in, so there's no real cost to
+/// not special-casing the empty case.
+const ARGS_SIZE: u64 = PAGE_SIZE;
 
 /// Everything needed to actually run a loaded ELF binary.
 pub struct LoadedElf {
@@ -44,6 +50,14 @@ pub struct LoadedElf {
     pub page_table: PhysFrame,
     pub entry: VirtAddr,
     pub stack_top: VirtAddr,
+    /// Where `load`'s own `args` ended up in the new address space, and
+    /// how many bytes of it are actually meaningful — handed to the new
+    /// thread as RDI/RSI at its very first instruction (see
+    /// `userspace::enter_ring3`), a separate convention from the RDI/RSI/
+    /// RDX/RCX one `int 0x80` uses once the program starts making
+    /// syscalls of its own.
+    pub args_ptr: VirtAddr,
+    pub args_len: u64,
 }
 
 /// Read a little-endian integer at `base + offset` — `None` if that range
@@ -98,6 +112,7 @@ pub fn load(
     bytes: &[u8],
     physical_memory_offset: VirtAddr,
     frame_allocator: &mut (impl FrameAllocator<Size4KiB> + FrameDeallocator<Size4KiB>),
+    args: &[u8],
 ) -> Option<(OffsetPageTable<'static>, LoadedElf)> {
     if bytes.len() < 64 {
         return None;
@@ -112,13 +127,15 @@ pub fn load(
     let (l4_frame, mut mapper) =
         unsafe { memory::new_address_space(physical_memory_offset, frame_allocator) };
 
-    match load_segments_and_stack(bytes, &mut mapper, physical_memory_offset, frame_allocator) {
-        Some((entry, stack_top)) => Some((
+    match load_segments_and_stack(bytes, &mut mapper, physical_memory_offset, frame_allocator, args) {
+        Some((entry, stack_top, args_ptr, args_len)) => Some((
             mapper,
             LoadedElf {
                 page_table: l4_frame,
                 entry,
                 stack_top,
+                args_ptr,
+                args_len,
             },
         )),
         None => {
@@ -139,7 +156,8 @@ fn load_segments_and_stack(
     mapper: &mut OffsetPageTable<'_>,
     physical_memory_offset: VirtAddr,
     frame_allocator: &mut impl FrameAllocator<Size4KiB>,
-) -> Option<(VirtAddr, VirtAddr)> {
+    args: &[u8],
+) -> Option<(VirtAddr, VirtAddr, VirtAddr, u64)> {
     let entry = read_u64(bytes, 0, 24)?;
     let phoff = read_u64(bytes, 0, 32)? as usize;
     let phentsize = read_u16(bytes, 0, 54)? as usize;
@@ -184,7 +202,18 @@ fn load_segments_and_stack(
     let stack_top = VirtAddr::try_new(stack_bottom.checked_add(STACK_SIZE)?.checked_sub(16)?).ok()?;
     let entry = VirtAddr::try_new(entry).ok()?;
 
-    Some((entry, stack_top))
+    // Right above the stack page, not sharing it — unlike the raw
+    // shellcode demos in userspace.rs (which fold code, data, and stack
+    // into one page on the strength of "small enough not to collide"),
+    // this loader already has real per-purpose pages to reach for, so
+    // `args` just gets its own rather than leaning on the same assumption.
+    // Not writable: nothing here needs the new program to be able to
+    // mutate its own argument bytes.
+    let args_bottom = stack_bottom.checked_add(STACK_SIZE)?;
+    map_segment(mapper, physical_memory_offset, frame_allocator, args, args_bottom, ARGS_SIZE, false)?;
+    let args_ptr = VirtAddr::try_new(args_bottom).ok()?;
+
+    Some((entry, stack_top, args_ptr, args.len() as u64))
 }
 
 fn align_up(addr: u64, align: u64) -> Option<u64> {

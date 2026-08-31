@@ -6,7 +6,10 @@
 //
 // Convention (loosely Linux-like, but this kernel's own): RAX holds the
 // syscall number going in and the return value coming back out; RDI, RSI,
-// RDX hold up to three arguments.
+// RDX, RCX hold up to four arguments. Only SYS_SPAWN currently needs all
+// four (see its own doc comment) — everything else ignores the ones it
+// doesn't use, the same way it always ignored RDX when it only needed one
+// or two.
 // ============================================================
 
 use crate::elf;
@@ -68,6 +71,7 @@ pub unsafe extern "C" fn entry() {
         "mov rsi, [rsp + 72]",  // rdi (arg1) -> dispatch's 2nd arg
         "mov rdx, [rsp + 80]",  // rsi (arg2) -> dispatch's 3rd arg
         "mov rcx, [rsp + 88]",  // rdx (arg3) -> dispatch's 4th arg
+        "mov r8, [rsp + 96]",   // rcx (arg4) -> dispatch's 5th arg
         // SysV requires RSP 16-aligned immediately before `call`, and
         // nothing here guarantees RSP0's own top was 16-aligned to begin
         // with — so rather than assume it, save RSP in a register whose
@@ -101,13 +105,13 @@ pub unsafe extern "C" fn entry() {
     );
 }
 
-extern "C" fn dispatch(number: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
+extern "C" fn dispatch(number: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) -> u64 {
     match number {
         SYS_WRITE => sys_write(arg1, arg2, arg3),
         SYS_READ => sys_read(arg1, arg2, arg3),
         SYS_OPEN => sys_open(arg1, arg2),
         SYS_CLOSE => sys_close(arg1),
-        SYS_SPAWN => sys_spawn(arg1, arg2),
+        SYS_SPAWN => sys_spawn(arg1, arg2, arg3, arg4),
         SYS_WAIT => sys_wait(arg1),
         // `scheduler::exit_current_thread()` returns `!`, not `u64` — it
         // never comes back here to produce a value, the same way it never
@@ -362,15 +366,25 @@ fn sys_close(fd: u64) -> u64 {
     if scheduler::close_file(fd) { 0 } else { u64::MAX }
 }
 
-/// spawn(path_ptr, path_len) -> pid, or u64::MAX if the path isn't valid
-/// UTF-8, doesn't name a file `fs::read_file` can find, or that file
-/// doesn't parse as a well-formed ELF64 executable (`elf::load`). Looks
+/// spawn(path_ptr, path_len, args_ptr, args_len) -> pid, or u64::MAX if the
+/// path isn't valid UTF-8, doesn't name a file `fs::read_file` can find,
+/// that file doesn't parse as a well-formed ELF64 executable (`elf::load`),
+/// or `args_len` is too long to fit the fixed staging buffer below. Looks
 /// `path` up on the FAT16 disk, loads it into a brand-new isolated address
 /// space, and spawns a new ring-3 thread running it (`scheduler::
 /// spawn_user`) — this is what actually lets a running program launch
 /// another one, the piece a shell needs that no other syscall here
 /// provides; every process before this one only ever came from kernel
 /// boot code calling `elf::load`/`scheduler::spawn_isolated` directly.
+///
+/// `args_ptr`/`args_len` describe a second buffer, entirely separate from
+/// `path` — raw bytes handed to the new program as-is (RDI/RSI at its
+/// first instruction, see `userspace::enter_ring3`), not parsed or
+/// validated as UTF-8 here at all: what they mean, if anything, is up to
+/// the program that receives them. `args_len == 0` is a normal "no
+/// arguments" call, not an error — `args_ptr` goes unchecked in that case,
+/// the same way an unused `path_ptr` would if `path_len` were somehow 0
+/// (which is itself already rejected above, unlike `args_len`).
 ///
 /// Not real `fork()`: this never duplicates the calling process's own
 /// memory the way a true fork would (needed for e.g. a process that wants
@@ -380,11 +394,12 @@ fn sys_close(fd: u64) -> u64 {
 /// programs, not clone itself, and real `fork` would additionally need
 /// copy-on-write address-space duplication this kernel has no machinery
 /// for at all yet.
-fn sys_spawn(path_ptr: u64, path_len: u64) -> u64 {
-    if path_len == 0 || path_len > 255 {
+fn sys_spawn(path_ptr: u64, path_len: u64, args_ptr: u64, args_len: u64) -> u64 {
+    if path_len == 0 || path_len > 255 || args_len > 255 {
         return u64::MAX;
     }
     let path_len = path_len as usize;
+    let args_len = args_len as usize;
 
     let mut staged_path = [0u8; 255];
     copy_from_user(path_ptr, &mut staged_path[..path_len]);
@@ -392,6 +407,15 @@ fn sys_spawn(path_ptr: u64, path_len: u64) -> u64 {
         Ok(s) => s,
         Err(_) => return u64::MAX,
     };
+
+    // Staged the same way `path` is, and for the same reason: both need
+    // copying out of the caller's own address space before the CR3 switch
+    // below leaves it behind.
+    let mut staged_args = [0u8; 255];
+    if args_len > 0 {
+        copy_from_user(args_ptr, &mut staged_args[..args_len]);
+    }
+    let args = &staged_args[..args_len];
 
     // Same reasoning as sys_open's own CR3 handling: fs::read_file,
     // elf::load, and scheduler::spawn_user all touch the kernel heap
@@ -403,7 +427,7 @@ fn sys_spawn(path_ptr: u64, path_len: u64) -> u64 {
     if needs_switch {
         unsafe { Cr3::write(kernel_page_table, flags) };
     }
-    let pid = spawn_from_path(path);
+    let pid = spawn_from_path(path, args);
     if needs_switch {
         unsafe { Cr3::write(caller_page_table, flags) };
     }
@@ -417,11 +441,11 @@ fn sys_spawn(path_ptr: u64, path_len: u64) -> u64 {
 /// switch out to the kernel's own address space and back, rather than the
 /// file lookup, the ELF parse, and the actual spawn each separately
 /// reasoning about which table needs to be active.
-fn spawn_from_path(path: &str) -> Option<scheduler::Pid> {
+fn spawn_from_path(path: &str, args: &[u8]) -> Option<scheduler::Pid> {
     let data = crate::fs::read_file(path)?;
     let physical_memory_offset = memory::physical_memory_offset();
     let (mut isolated_mapper, loaded) =
-        elf::load(&data, physical_memory_offset, &mut memory::GlobalFrameAllocator)?;
+        elf::load(&data, physical_memory_offset, &mut memory::GlobalFrameAllocator, args)?;
 
     // No long-lived mapper of its own to reach for here, unlike
     // kernel_main — memory::current_mapper builds one fresh over whatever
@@ -431,6 +455,8 @@ fn spawn_from_path(path: &str) -> Option<scheduler::Pid> {
     Some(scheduler::spawn_user(
         loaded.entry,
         loaded.stack_top,
+        loaded.args_ptr,
+        loaded.args_len,
         loaded.page_table,
         &mut kernel_mapper,
         &mut isolated_mapper,

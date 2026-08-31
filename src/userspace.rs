@@ -103,6 +103,7 @@ fn mov_r64_r64(code: &mut Vec<u8>, dst: u8, src: u8) {
 // `B8+r`/ModRM forms above only reach the low 8 GPRs, which is all any of
 // this demo code needs).
 const RAX: u8 = 0;
+const RCX: u8 = 1;
 const RDX: u8 = 2;
 const RSI: u8 = 6;
 const RDI: u8 = 7;
@@ -256,7 +257,7 @@ pub fn run_demo() -> ! {
     let stack_top = VirtAddr::new(USER_PAGE_ADDR + 4096 - 16); // top of the same page, 16-aligned
 
     unsafe {
-        enter_ring3(entry, stack_top);
+        enter_ring3(entry, stack_top, VirtAddr::zero(), 0);
     }
 }
 
@@ -269,7 +270,7 @@ pub fn run_isolated_demo() -> ! {
     let stack_top = VirtAddr::new(ISOLATED_USER_PAGE_ADDR + 4096 - 16);
 
     unsafe {
-        enter_ring3(entry, stack_top);
+        enter_ring3(entry, stack_top, VirtAddr::zero(), 0);
     }
 }
 
@@ -413,7 +414,7 @@ pub fn run_open_read_demo() -> ! {
     let stack_top = VirtAddr::new(OPEN_READ_DEMO_ADDR + 4096 - 16);
 
     unsafe {
-        enter_ring3(entry, stack_top);
+        enter_ring3(entry, stack_top, VirtAddr::zero(), 0);
     }
 }
 
@@ -504,7 +505,7 @@ pub fn run_bad_pointer_demo() -> ! {
     let stack_top = VirtAddr::new(BAD_POINTER_DEMO_ADDR + 4096 - 16);
 
     unsafe {
-        enter_ring3(entry, stack_top);
+        enter_ring3(entry, stack_top, VirtAddr::zero(), 0);
     }
 }
 
@@ -527,6 +528,8 @@ const SPAWN_WAIT_DONE_MSG: &[u8] = b"spawn/wait demo: child finished, parent res
 ///     mov rax, SYS_SPAWN
 ///     mov rdi, path_addr        ; "GREET.ELF"
 ///     mov rsi, path_len
+///     mov rdx, 0                 ; args_ptr — unused, since args_len is 0
+///     mov rcx, 0                  ; args_len — this demo passes no arguments
 ///     int 0x80                  ; rax = pid (or u64::MAX)
 ///     mov rdi, rax               ; pid -> rdi for wait
 ///     mov rax, SYS_WAIT
@@ -559,6 +562,15 @@ fn build_spawn_wait_shellcode(page_addr: u64) -> Vec<u8> {
     let path_ptr_patch_at = code.len() + 2;
     mov_imm64(&mut code, RDI, 0); // path_addr, patched in below
     mov_imm64(&mut code, RSI, SPAWN_WAIT_CHILD_PATH.len() as u64);
+    // args_ptr/args_len: this demo passes no arguments, but SYS_SPAWN's
+    // dispatch reads RDX/RCX regardless (see src/syscall.rs) — leaving
+    // them at whatever the compiler happened to put there instead of
+    // explicitly zeroing them the way every other argument here is set
+    // would make args_len an unpredictable, possibly-huge value, not a
+    // reliable "no arguments" the way an omitted argument would be in a
+    // higher-level calling convention.
+    mov_imm64(&mut code, RDX, 0); // args_ptr — unused, since args_len is 0
+    mov_imm64(&mut code, RCX, 0); // args_len
     code.extend_from_slice(&[0xcd, 0x80]); // int 0x80
     mov_r64_r64(&mut code, RDI, RAX); // pid -> rdi
 
@@ -635,7 +647,7 @@ pub fn run_spawn_wait_demo() -> ! {
     let stack_top = VirtAddr::new(SPAWN_WAIT_DEMO_ADDR + 4096 - 16);
 
     unsafe {
-        enter_ring3(entry, stack_top);
+        enter_ring3(entry, stack_top, VirtAddr::zero(), 0);
     }
 }
 
@@ -757,7 +769,7 @@ fn spawn_loaded_elf_demo(
     // hands `elf::load` an arbitrary ring-3-named path and has to handle
     // `None` for real.
     let (mut isolated_mapper, loaded) =
-        elf::load(elf_bytes, physical_memory_offset, frame_allocator)
+        elf::load(elf_bytes, physical_memory_offset, frame_allocator, &[])
             .expect("elf::load: kernel's own or build.rs's ECHO.ELF should always be well-formed");
 
     crate::println!(
@@ -790,7 +802,7 @@ pub fn run_elf_demo() -> ! {
     let stack_top = VirtAddr::new(ELF_DEMO_STACK_TOP.load(Ordering::Relaxed));
 
     unsafe {
-        enter_ring3(entry, stack_top);
+        enter_ring3(entry, stack_top, VirtAddr::zero(), 0);
     }
 }
 
@@ -803,11 +815,21 @@ pub fn run_elf_demo() -> ! {
 /// this directly too, for a thread spawned via `scheduler::spawn_user`
 /// rather than one of this module's own fixed boot-time demos.
 ///
+/// `args_ptr`/`args_len` land in RDI/RSI, the very first thing the new
+/// program sees — this kernel's own program-start convention (distinct
+/// from the RDI/RSI/RDX/RCX `int 0x80` uses once the program goes on to
+/// make syscalls of its own), for a caller that wants the new program to
+/// find its arguments the moment it starts rather than needing a syscall
+/// to fetch them. `VirtAddr::zero()`/`0` for a caller with nothing to
+/// pass — every boot-time demo below, none of which read RDI/RSI at
+/// entry for anything other than the syscalls they immediately overwrite
+/// those registers with anyway.
+///
 /// # Safety
 /// `entry` and `stack_top` must point into a page mapped PRESENT |
 /// USER_ACCESSIBLE (and, since it also serves as the stack, WRITABLE) —
 /// see `map_demo_page`.
-pub(crate) unsafe fn enter_ring3(entry: VirtAddr, stack_top: VirtAddr) -> ! {
+pub(crate) unsafe fn enter_ring3(entry: VirtAddr, stack_top: VirtAddr, args_ptr: VirtAddr, args_len: u64) -> ! {
     let (code_selector, data_selector) = gdt::user_selectors();
 
     unsafe {
@@ -834,6 +856,8 @@ pub(crate) unsafe fn enter_ring3(entry: VirtAddr, stack_top: VirtAddr) -> ! {
             rflags = in(reg) 0x202u64, // IF (bit 9) set; bit 1 is reserved-as-1
             cs = in(reg) u64::from(code_selector.0),
             rip = in(reg) entry.as_u64(),
+            in("rdi") args_ptr.as_u64(),
+            in("rsi") args_len,
             options(noreturn),
         );
     }

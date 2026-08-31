@@ -102,15 +102,17 @@ struct Thread {
     open_files: [Option<OpenFile>; MAX_OPEN_FILES],
     /// For a thread meant to drop into ring 3 via the shared
     /// `ring3_trampoline` (`spawn_user`, below) — the user-mode entry
-    /// point and initial stack pointer, consumed once the same way
-    /// `entry` is. `None` for every other thread: the fixed handful of
-    /// boot-time demos in src/userspace.rs each carry their own dedicated
-    /// entry/stack-top statics instead (fine for them — there's only ever
-    /// one of each in flight at a time — but that doesn't generalize to
-    /// spawning arbitrary programs on demand, where two spawns could race
-    /// to stomp the same statics), and the boot thread never runs through
-    /// any trampoline at all.
-    user_entry: Option<(VirtAddr, VirtAddr)>,
+    /// point, initial stack pointer, and argument block (where it lives in
+    /// the new address space, and how many bytes of it are meaningful —
+    /// see `elf::LoadedElf`), consumed once the same way `entry` is. `None`
+    /// for every other thread: the fixed handful of boot-time demos in
+    /// src/userspace.rs each carry their own dedicated entry/stack-top
+    /// statics instead (fine for them — there's only ever one of each in
+    /// flight at a time — but that doesn't generalize to spawning
+    /// arbitrary programs on demand, where two spawns could race to stomp
+    /// the same statics), and the boot thread never runs through any
+    /// trampoline at all.
+    user_entry: Option<(VirtAddr, VirtAddr, VirtAddr, u64)>,
 }
 
 /// A file `syscall::SYS_OPEN` has already read in full from `fs::read_file`
@@ -455,6 +457,8 @@ pub fn spawn_isolated(
 pub fn spawn_user(
     user_entry: VirtAddr,
     user_stack_top: VirtAddr,
+    args_ptr: VirtAddr,
+    args_len: u64,
     page_table: PhysFrame,
     kernel_mapper: &mut OffsetPageTable,
     isolated_mapper: &mut OffsetPageTable,
@@ -462,7 +466,7 @@ pub fn spawn_user(
 ) -> Pid {
     spawn_isolated_inner(
         ring3_trampoline,
-        Some((user_entry, user_stack_top)),
+        Some((user_entry, user_stack_top, args_ptr, args_len)),
         page_table,
         kernel_mapper,
         isolated_mapper,
@@ -475,7 +479,7 @@ pub fn spawn_user(
 /// whether it carries a `user_entry` for that trampoline to consume.
 fn spawn_isolated_inner(
     entry: fn() -> !,
-    user_entry: Option<(VirtAddr, VirtAddr)>,
+    user_entry: Option<(VirtAddr, VirtAddr, VirtAddr, u64)>,
     page_table: PhysFrame,
     kernel_mapper: &mut OffsetPageTable,
     isolated_mapper: &mut OffsetPageTable,
@@ -624,7 +628,7 @@ extern "C" fn thread_trampoline() -> ! {
 /// `user_entry` (set once, by `spawn_user`) and drops straight to ring 3
 /// there; never returns.
 fn ring3_trampoline() -> ! {
-    let (entry, stack_top) = interrupts::without_interrupts(|| {
+    let (entry, stack_top, args_ptr, args_len) = interrupts::without_interrupts(|| {
         let mut guard = SCHEDULER.lock();
         let state = guard.as_mut().expect("scheduler not initialized");
         state.threads[state.current]
@@ -636,7 +640,7 @@ fn ring3_trampoline() -> ! {
     // No interrupts::enable() needed here, unlike thread_trampoline: this
     // is reached *through* thread_trampoline's own call to entry(), so
     // interrupts are already enabled by the time execution gets here.
-    unsafe { crate::userspace::enter_ring3(entry, stack_top) }
+    unsafe { crate::userspace::enter_ring3(entry, stack_top, args_ptr, args_len) }
 }
 
 /// Whether `pid` (from `spawn_isolated`/`spawn_user`) still refers to a
