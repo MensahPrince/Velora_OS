@@ -97,6 +97,16 @@ fn mov_r64_r64(code: &mut Vec<u8>, dst: u8, src: u8) {
     code.push(0xC0 | (src << 3) | dst);
 }
 
+/// `cmp r/m64, imm8` (opcode `83 /7`, sign-extending `imm8` to 64 bits) —
+/// compares `reg` against `imm8` (as a signed value; pass `0xFF` for `-1`,
+/// i.e. `u64::MAX`, the way `build_bad_pointer_shellcode` does).
+fn cmp_r64_imm8(code: &mut Vec<u8>, reg_opcode: u8, imm8: u8) {
+    code.push(0x48); // REX.W
+    code.push(0x83);
+    code.push(0xF8 | reg_opcode); // ModRM: mod=11, reg=111 (/7, CMP), rm=reg_opcode
+    code.push(imm8);
+}
+
 // Register encodings shared by every shellcode builder below (the plain
 // `B8+r`/ModRM forms above only reach the low 8 GPRs, which is all any of
 // this demo code needs).
@@ -406,6 +416,152 @@ pub fn spawn_open_read_demo(
 pub fn run_open_read_demo() -> ! {
     let entry = VirtAddr::new(OPEN_READ_DEMO_ADDR);
     let stack_top = VirtAddr::new(OPEN_READ_DEMO_ADDR + 4096 - 16);
+
+    unsafe {
+        enter_ring3(entry, stack_top);
+    }
+}
+
+/// Where the bad-pointer demo's code+stack page lives — another P4 slot
+/// nothing else in this kernel uses.
+const BAD_POINTER_DEMO_ADDR: u64 = 0x7A00_0000_0000;
+
+/// A plausible-looking but entirely unmapped address — nothing in this
+/// kernel has ever mapped anywhere near it — for the demo to hand
+/// `sys_write` as if it were a real buffer.
+const BAD_POINTER: u64 = 0xdead_beef;
+
+const BAD_POINTER_REJECTED_MSG: &[u8] = b"bad pointer correctly rejected by copy_from_user\n";
+const BAD_POINTER_NOT_REJECTED_MSG: &[u8] = b"BUG: bad pointer was not rejected!\n";
+
+/// Builds:
+///
+/// ```text
+///     mov rax, SYS_WRITE
+///     mov rdi, 1
+///     mov rsi, BAD_POINTER      ; deliberately unmapped
+///     mov rdx, 10
+///     int 0x80                  ; rax = result — expected: u64::MAX
+///     cmp rax, -1
+///     je  rejected
+/// not_rejected:
+///     mov rax, SYS_WRITE
+///     mov rdi, 1
+///     mov rsi, fail_msg_addr
+///     mov rdx, BAD_POINTER_NOT_REJECTED_MSG.len()
+///     int 0x80
+///     jmp done
+/// rejected:
+///     mov rax, SYS_WRITE
+///     mov rdi, 1
+///     mov rsi, ok_msg_addr
+///     mov rdx, BAD_POINTER_REJECTED_MSG.len()
+///     int 0x80
+/// done:
+///     mov rax, SYS_EXIT
+///     int 0x80
+/// fail_msg: "BUG: bad pointer was not rejected!\n"
+/// ok_msg: "bad pointer correctly rejected by copy_from_user\n"
+/// ```
+///
+/// Proves `syscall::copy_from_user`/`copy_to_user` actually protect the
+/// kernel, not just that they exist and compile: before they existed, this
+/// exact `write` call would have page-faulted straight into a kernel
+/// panic (see `interrupts::page_fault_handler`) — this demo running to
+/// completion and printing the "correctly rejected" message *is* the
+/// proof, the same way the reclamation demos elsewhere in this module
+/// prove themselves by not panicking rather than by asserting anything
+/// directly.
+fn build_bad_pointer_shellcode(page_addr: u64) -> Vec<u8> {
+    let mut code = Vec::new();
+
+    mov_imm64(&mut code, RAX, syscall::SYS_WRITE);
+    mov_imm64(&mut code, RDI, 1); // fd = stdout
+    mov_imm64(&mut code, RSI, BAD_POINTER);
+    mov_imm64(&mut code, RDX, 10);
+    code.extend_from_slice(&[0xcd, 0x80]); // int 0x80
+    cmp_r64_imm8(&mut code, RAX, 0xFF); // cmp rax, -1
+    let je_opcode_at = code.len();
+    code.extend_from_slice(&[0x74, 0x00]); // je rejected (patched below)
+
+    // not_rejected: the bug case.
+    mov_imm64(&mut code, RAX, syscall::SYS_WRITE);
+    mov_imm64(&mut code, RDI, 1);
+    let fail_msg_patch_at = code.len() + 2;
+    mov_imm64(&mut code, RSI, 0); // fail_msg_addr, patched in below
+    mov_imm64(&mut code, RDX, BAD_POINTER_NOT_REJECTED_MSG.len() as u64);
+    code.extend_from_slice(&[0xcd, 0x80]); // int 0x80
+    let jmp_done_opcode_at = code.len();
+    code.extend_from_slice(&[0xeb, 0x00]); // jmp done (patched below)
+
+    // rejected: the expected case.
+    let rejected = code.len();
+    code[je_opcode_at + 1] = rel8(rejected, je_opcode_at + 2);
+    mov_imm64(&mut code, RAX, syscall::SYS_WRITE);
+    mov_imm64(&mut code, RDI, 1);
+    let ok_msg_patch_at = code.len() + 2;
+    mov_imm64(&mut code, RSI, 0); // ok_msg_addr, patched in below
+    mov_imm64(&mut code, RDX, BAD_POINTER_REJECTED_MSG.len() as u64);
+    code.extend_from_slice(&[0xcd, 0x80]); // int 0x80
+
+    // done:
+    let done = code.len();
+    code[jmp_done_opcode_at + 1] = rel8(done, jmp_done_opcode_at + 2);
+    mov_imm64(&mut code, RAX, syscall::SYS_EXIT);
+    code.extend_from_slice(&[0xcd, 0x80]); // int 0x80, never returns
+
+    // The two fixed messages immediately follow the code — now that the
+    // code is fully assembled, their real addresses are known.
+    let fail_msg_addr = page_addr + code.len() as u64;
+    code[fail_msg_patch_at..fail_msg_patch_at + 8].copy_from_slice(&fail_msg_addr.to_le_bytes());
+    code.extend_from_slice(BAD_POINTER_NOT_REJECTED_MSG);
+
+    let ok_msg_addr = page_addr + code.len() as u64;
+    code[ok_msg_patch_at..ok_msg_patch_at + 8].copy_from_slice(&ok_msg_addr.to_le_bytes());
+    code.extend_from_slice(BAD_POINTER_REJECTED_MSG);
+
+    code
+}
+
+/// Build a fresh, isolated address space, map the bad-pointer demo
+/// shellcode into it, and — if `run` — spawn a thread that drops into it.
+/// Same shape as `spawn_open_read_demo`; safe to leave permanently enabled
+/// for the same reason — it runs exactly once and exits for good.
+pub fn spawn_bad_pointer_demo(
+    kernel_mapper: &mut OffsetPageTable<'_>,
+    physical_memory_offset: VirtAddr,
+    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
+    run: bool,
+) {
+    let (l4_frame, mut isolated_mapper) =
+        unsafe { memory::new_address_space(physical_memory_offset, frame_allocator) };
+
+    let code = build_bad_pointer_shellcode(BAD_POINTER_DEMO_ADDR);
+    map_shellcode_page(
+        &mut isolated_mapper,
+        frame_allocator,
+        physical_memory_offset,
+        BAD_POINTER_DEMO_ADDR,
+        &code,
+    );
+
+    if run {
+        scheduler::spawn_isolated(
+            run_bad_pointer_demo,
+            l4_frame,
+            kernel_mapper,
+            &mut isolated_mapper,
+            frame_allocator,
+        );
+    }
+}
+
+/// Spawned via `spawn_bad_pointer_demo`. Same shape as `run_open_read_demo`
+/// — it's the address space and the shellcode `spawn_bad_pointer_demo`
+/// already set up (not this function) that make it what it is.
+pub fn run_bad_pointer_demo() -> ! {
+    let entry = VirtAddr::new(BAD_POINTER_DEMO_ADDR);
+    let stack_top = VirtAddr::new(BAD_POINTER_DEMO_ADDR + 4096 - 16);
 
     unsafe {
         enter_ring3(entry, stack_top);

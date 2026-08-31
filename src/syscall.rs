@@ -9,8 +9,10 @@
 // RDX hold up to three arguments.
 // ============================================================
 
+use crate::memory;
 use crate::scheduler;
 use core::arch::naked_asm;
+use x86_64::VirtAddr;
 use x86_64::registers::control::Cr3;
 
 pub const SYS_WRITE: u64 = 0;
@@ -112,33 +114,83 @@ extern "C" fn dispatch(number: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
     }
 }
 
-/// write(fd, ptr, len) -> bytes written, or u64::MAX on error. Only
-/// fd == 1 (stdout, the VGA console) is supported.
+/// Copy `out.len()` bytes from the calling thread's own address space at
+/// `ptr` into `out`, or return `None` — instead of blindly trusting `ptr`
+/// and letting a bad one page-fault (and, with no course-correction beyond
+/// `panic!`, take the whole kernel down with it) — if `ptr` is null, isn't
+/// a canonical address at all (`VirtAddr::try_new`), or any page the range
+/// covers isn't mapped `PRESENT | USER_ACCESSIBLE` for the *currently
+/// active* page table (`memory::user_range_mapped`; `int 0x80` never
+/// switches CR3, so that's already exactly the calling thread's own table,
+/// isolated or not).
+fn copy_from_user(ptr: u64, out: &mut [u8]) -> Option<()> {
+    if ptr == 0 {
+        return None;
+    }
+    let addr = VirtAddr::try_new(ptr).ok()?;
+    if !memory::user_range_mapped(memory::physical_memory_offset(), addr, out.len(), false) {
+        return None;
+    }
+    unsafe {
+        core::ptr::copy_nonoverlapping(ptr as *const u8, out.as_mut_ptr(), out.len());
+    }
+    Some(())
+}
+
+/// Whether `[ptr, ptr + len)` is safe to write `len` bytes into in the
+/// calling thread's own address space — the check half of `copy_to_user`,
+/// pulled out on its own so a caller with side effects to perform first
+/// (`sys_read_stdin`/`sys_read_file`, which otherwise pop a keystroke or
+/// advance an open file's read position before ever finding out the
+/// destination was bad) can validate the destination *before* doing
+/// anything that can't be undone, rather than losing that data to a
+/// doomed copy.
+fn user_write_ok(ptr: u64, len: usize) -> bool {
+    if ptr == 0 {
+        return false;
+    }
+    match VirtAddr::try_new(ptr) {
+        Ok(addr) => memory::user_range_mapped(memory::physical_memory_offset(), addr, len, true),
+        Err(_) => false,
+    }
+}
+
+/// The write-direction counterpart to `copy_from_user`: copy all of `data`
+/// into the calling thread's own address space at `ptr`, or `None` if
+/// `user_write_ok` rejects the range.
+fn copy_to_user(ptr: u64, data: &[u8]) -> Option<()> {
+    if !user_write_ok(ptr, data.len()) {
+        return None;
+    }
+    unsafe {
+        core::ptr::copy_nonoverlapping(data.as_ptr(), ptr as *mut u8, data.len());
+    }
+    Some(())
+}
+
+/// write(fd, ptr, len) -> bytes written, or u64::MAX on error (including a
+/// `ptr`/`len` that isn't actually mapped in the caller's own address
+/// space — see `copy_from_user`). Only fd == 1 (stdout, the VGA console)
+/// is supported.
 ///
-/// `ptr`/`len` describe a buffer in the *caller's own* address space.
 /// `int 0x80` doesn't change CR3, so at this point it's still whatever the
-/// calling thread's own page table is — exactly what's needed to read
-/// its buffer correctly, isolated or not. No CR3 juggling needed here at
-/// all: println! only ever touches the VGA buffer, a fixed physical
-/// address identity-mapped into every address space this kernel builds,
-/// never the heap.
-///
-/// Not validated beyond a length cap: a caller passing a pointer that
-/// isn't actually mapped (or not readable) in its own address space will
-/// page-fault the kernel, which — with no course-correction beyond
-/// panicking — takes the whole kernel down with it. A real
-/// `copy_from_user` (checking the mapping first, or handling the fault
-/// and returning an error instead of panicking) is exactly the kind of
-/// thing a from-scratch kernel adds once it needs to survive a buggy or
-/// hostile process; deliberately out of scope for this first pass.
+/// calling thread's own page table is — exactly what `copy_from_user`
+/// needs to check and then read `ptr`'s buffer correctly, isolated or not.
+/// No further CR3 juggling needed here at all: `println!` only ever
+/// touches the VGA buffer, a fixed physical address identity-mapped into
+/// every address space this kernel builds, never the heap.
 fn sys_write(fd: u64, ptr: u64, len: u64) -> u64 {
-    if fd != 1 || ptr == 0 {
+    if fd != 1 {
         return u64::MAX;
     }
     let len = len.min(1024) as usize;
 
-    let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len) };
-    match core::str::from_utf8(bytes) {
+    let mut staged = [0u8; 1024];
+    if copy_from_user(ptr, &mut staged[..len]).is_none() {
+        return u64::MAX;
+    }
+
+    match core::str::from_utf8(&staged[..len]) {
         Ok(s) => crate::print!("{}", s),
         Err(_) => crate::print!("<sys_write: invalid utf-8>"),
     }
@@ -177,7 +229,16 @@ fn sys_read(fd: u64, ptr: u64, len: u64) -> u64 {
 /// address space has to be forced for that part. A stack-local buffer
 /// stages the result so the switch back to the caller's own CR3 happens
 /// *before* touching its buffer.
+///
+/// Validates `ptr` (`user_write_ok`) *before* popping anything off the
+/// keyboard queue: those bytes are gone once popped, so checking only
+/// after would mean a bad `ptr` silently discards real input instead of
+/// just failing cleanly with nothing consumed.
 fn sys_read_stdin(ptr: u64, len: usize) -> u64 {
+    if !user_write_ok(ptr, len) {
+        return u64::MAX;
+    }
+
     let mut staged = [0u8; 256];
     let read_count = {
         let (caller_page_table, flags) = Cr3::read();
@@ -204,10 +265,8 @@ fn sys_read_stdin(ptr: u64, len: usize) -> u64 {
         count
     };
 
-    if read_count > 0 {
-        unsafe {
-            core::ptr::copy_nonoverlapping(staged.as_ptr(), ptr as *mut u8, read_count);
-        }
+    if read_count > 0 && copy_to_user(ptr, &staged[..read_count]).is_none() {
+        return u64::MAX;
     }
     read_count as u64
 }
@@ -216,14 +275,21 @@ fn sys_read_stdin(ptr: u64, len: usize) -> u64 {
 /// calling thread's own `fd` (`scheduler::read_open_file`, which handles
 /// the same CR3 juggling `sys_read_stdin` does above, since an open file's
 /// buffered bytes are heap-backed too) into its buffer at `ptr`.
+///
+/// Same reasoning as `sys_read_stdin`'s own up-front check: `ptr` is
+/// validated before `read_open_file` ever advances the file's read
+/// position, so a bad `ptr` fails cleanly rather than silently skipping
+/// past real file contents that were never actually delivered anywhere.
 fn sys_read_file(fd: u64, ptr: u64, len: usize) -> u64 {
+    if !user_write_ok(ptr, len) {
+        return u64::MAX;
+    }
+
     let mut staged = [0u8; 256];
     match scheduler::read_open_file(fd, &mut staged[..len]) {
         Some(count) => {
-            if count > 0 {
-                unsafe {
-                    core::ptr::copy_nonoverlapping(staged.as_ptr(), ptr as *mut u8, count);
-                }
+            if count > 0 && copy_to_user(ptr, &staged[..count]).is_none() {
+                return u64::MAX;
             }
             count as u64
         }
@@ -240,10 +306,10 @@ fn sys_read_file(fd: u64, ptr: u64, len: usize) -> u64 {
 /// copy out of that buffer.
 ///
 /// `path_ptr`/`path_len` describe a buffer in the caller's own address
-/// space, trusted the same way `sys_write`'s `ptr`/`len` are (see its own
-/// doc comment) — capped at a small length rather than validated.
+/// space, checked via `copy_from_user` — capped at a small length rather
+/// than an arbitrary one.
 fn sys_open(path_ptr: u64, path_len: u64) -> u64 {
-    if path_ptr == 0 || path_len == 0 || path_len > 255 {
+    if path_len == 0 || path_len > 255 {
         return u64::MAX;
     }
     let path_len = path_len as usize;
@@ -257,8 +323,8 @@ fn sys_open(path_ptr: u64, path_len: u64) -> u64 {
     // to be captured first, independent of whichever address space is
     // active once `fs::read_file` actually runs.
     let mut staged_path = [0u8; 255];
-    unsafe {
-        core::ptr::copy_nonoverlapping(path_ptr as *const u8, staged_path.as_mut_ptr(), path_len);
+    if copy_from_user(path_ptr, &mut staged_path[..path_len]).is_none() {
+        return u64::MAX;
     }
     let path = match core::str::from_utf8(&staged_path[..path_len]) {
         Ok(s) => s,

@@ -124,7 +124,106 @@ fn translate_addr_inner(addr: VirtAddr, physical_memory_offset: VirtAddr)
     Some(frame.start_address() + u64::from(addr.page_offset()))
 }
 
+// ------------------------------------------------------------------
+// Validated access to a syscall caller's own memory
+// ------------------------------------------------------------------
+// `syscall.rs`'s `copy_from_user`/`copy_to_user` are the only intended
+// callers of `user_range_mapped` below: every syscall handler used to trust
+// a ring-3-supplied pointer outright and let a bad one page-fault (and,
+// since that fault has no course-correction beyond `panic!`, take the
+// entire kernel down) — this is the "check the mapping first" alternative
+// the doc comments on those old, unchecked accesses always said belonged
+// here eventually.
 
+/// Whether every page in `[addr, addr + len)` is mapped `PRESENT |
+/// USER_ACCESSIBLE` (and, if `need_write`, also `WRITABLE`) — checked at
+/// *every* level of the walk (L4 through L1), matching how the CPU itself
+/// evaluates access permissions: a page is only reachable from CPL 3 if
+/// every table entry on the path to it (not just the final one) carries
+/// the U/S bit, and a write is only allowed if every entry on the path
+/// carries R/W. In practice every mapping this kernel ever builds
+/// (`Mapper::map_to`'s default `parent_table_flags`) already propagates the
+/// same flags to every level, so checking only the leaf would happen to
+/// agree here — but checking the whole path is what's actually correct,
+/// rather than relying on that always continuing to hold.
+///
+/// Reads the *currently active* L4 table via `CR3` — the right table for a
+/// syscall handler to check: `int 0x80` never switches CR3, so "active"
+/// already means "the calling thread's own table," isolated or not.
+///
+/// `len == 0` is trivially `true` (nothing to check). An `addr`/`len`
+/// combination that would overflow past the top of the address space is
+/// `false` — callers still need to reject the "obviously nonsensical"
+/// cases themselves (a null `addr`, an implausibly large `len`) before
+/// this is worth calling at all.
+pub fn user_range_mapped(
+    physical_memory_offset: VirtAddr,
+    addr: VirtAddr,
+    len: usize,
+    need_write: bool,
+) -> bool {
+    if len == 0 {
+        return true;
+    }
+    let Some(last_byte) = addr.as_u64().checked_add(len as u64 - 1) else {
+        return false;
+    };
+
+    let first_page = Page::<Size4KiB>::containing_address(addr);
+    let last_page = Page::<Size4KiB>::containing_address(VirtAddr::new(last_byte));
+
+    let mut page = first_page;
+    loop {
+        if !page_accessible(physical_memory_offset, page.start_address(), need_write) {
+            return false;
+        }
+        if page == last_page {
+            return true;
+        }
+        page += 1;
+    }
+}
+
+/// The single-page building block `user_range_mapped` calls once per page
+/// in its range: walk the active page table for `addr`, requiring
+/// `PRESENT | USER_ACCESSIBLE` (and, if `need_write`, `WRITABLE`) at every
+/// level. A huge-page leaf (never produced by this kernel's own mapping
+/// code, which only ever maps `Size4KiB` pages) is treated as
+/// inaccessible rather than guessed at, the same conservative choice
+/// `translate_addr_inner` makes by panicking on one instead of pretending
+/// to understand it.
+fn page_accessible(physical_memory_offset: VirtAddr, addr: VirtAddr, need_write: bool) -> bool {
+    use x86_64::registers::control::Cr3;
+    use x86_64::structures::paging::PageTableFlags;
+    use x86_64::structures::paging::page_table::FrameError;
+
+    let mut required = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
+    if need_write {
+        required |= PageTableFlags::WRITABLE;
+    }
+
+    let (level_4_table_frame, _) = Cr3::read();
+    let table_indexes = [addr.p4_index(), addr.p3_index(), addr.p2_index(), addr.p1_index()];
+    let mut frame = level_4_table_frame;
+
+    for &index in &table_indexes {
+        let virt = physical_memory_offset + frame.start_address().as_u64();
+        let table: &PageTable = unsafe { &*virt.as_ptr::<PageTable>() };
+        let entry = &table[index];
+
+        if !entry.flags().contains(required) {
+            return false;
+        }
+
+        frame = match entry.frame() {
+            Ok(frame) => frame,
+            Err(FrameError::FrameNotPresent) => return false,
+            Err(FrameError::HugeFrame) => return false,
+        };
+    }
+
+    true
+}
 
 use x86_64:: structures::paging::{
     Page, PhysFrame, Mapper, Size4KiB, FrameAllocator

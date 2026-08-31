@@ -239,6 +239,20 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
         velora_os::userspace::spawn_open_read_demo(&mut mapper, phys_mem_offset, &mut frame_allocator, true);
     }
 
+    // Validated syscall arguments (`syscall::copy_from_user`/
+    // `copy_to_user`, src/syscall.rs): before this, every syscall handler
+    // trusted a ring-3-supplied pointer outright, so a bad one would
+    // page-fault straight into a kernel panic — one misbehaving process
+    // taking the whole kernel down with it. This ring-3 demo deliberately
+    // calls `write(1, 0xdeadbeef, 10)` (src/userspace.rs's
+    // `build_bad_pointer_shellcode`) and checks that the syscall rejects
+    // it cleanly instead. `run: true` permanently, same reasoning as the
+    // open/read demo above: it runs once and exits for good.
+    #[cfg(not(test))]
+    {
+        velora_os::userspace::spawn_bad_pointer_demo(&mut mapper, phys_mem_offset, &mut frame_allocator, true);
+    }
+
     // Process lifecycle (src/scheduler.rs's exit_current_thread, reached
     // here directly since this is a kernel-mode thread; a ring-3 one
     // would reach the same function via syscall::SYS_EXIT instead):

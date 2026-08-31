@@ -34,6 +34,7 @@ The project exists to develop a rigorous, from-scratch understanding of the mech
 
 - The kernel constructs ring-3 (user-mode) GDT segments and transitions execution to CPL 3 via a manually constructed `IRETQ` frame.
 - A register-based system-call ABI is exposed through a software interrupt (`int 0x80`), serviced by a hand-written entry stub that preserves the full general-purpose register set. This is necessary because the `x86-interrupt` calling convention cannot expose arbitrary registers to handler code: the compiler's generated prologue relocates them before user code runs. Five calls are currently implemented: `write(fd, buf, len)`, `read(fd, buf, len)`, `exit()`, `open(path, path_len)`, and `close(fd)`. `open` looks a file up by path through `fs::read_file` and buffers its full contents (this filesystem driver has no partial/streaming read of its own) in a per-thread file-descriptor table — capped at a small, fixed number of slots per thread, and reachable only by the thread that opened it — so an isolated process can't see or exhaust another's open files, the same isolation this kernel already enforces for memory; `read` on a returned fd slices out of that buffer, and any files still open at exit are freed automatically alongside the rest of that thread's own state.
+- Every syscall argument that's actually a pointer into the caller's own address space is validated before use (`syscall::copy_from_user`/`copy_to_user`), rather than trusted outright: each walks the calling thread's own page table — the right one to check, since `int 0x80` never switches CR3 — confirming every page the argument's range touches is really mapped and accessible from CPL 3 (and, for a write destination, actually writable) at *every* level of the walk, not just the leaf, matching how the CPU itself evaluates access permissions. Before this, a bad pointer from a ring-3 program would page-fault straight into a kernel panic; now the syscall just returns an error and the kernel keeps running, proven by a ring-3 demo that deliberately calls `write` with an unmapped address and confirms the kernel survives it.
 
 ### Process Loading and Lifecycle
 
@@ -121,7 +122,7 @@ cargo test    # execute the integration test suite (headless)
 
 ## Future Work
 
-In approximate dependency order: `fork`/`exec`-equivalent primitives built on top of the now-working spawn/exit lifecycle (including full address-space reclamation); a real `copy_from_user` (checking a caller-supplied pointer's mapping before dereferencing it, or handling the resulting fault, rather than trusting it and panicking the whole kernel on a bad one — `sys_write`/`sys_read`/`sys_open` all still take this shortcut); and, further out, filesystem writes and subdirectory support.
+In approximate dependency order: `fork`/`exec`-equivalent primitives built on top of the now-working spawn/exit lifecycle (including full address-space reclamation); killing just the offending process on a bad syscall pointer, now that `copy_from_user`/`copy_to_user` (see Privilege Isolation and System Calls, above) catch one instead of panicking the whole kernel — today it's still just an error return, with the calling thread left running; and, further out, filesystem writes and subdirectory support.
 
 ## References
 
